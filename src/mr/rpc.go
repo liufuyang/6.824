@@ -6,8 +6,70 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
+import (
+	"fmt"
+	"os"
+)
 import "strconv"
+
+type TaskType int
+
+const (
+	MapTaskType     TaskType = 0
+	ReduceTaskType  TaskType = 1
+	WaitingTaskType TaskType = 2 // continue get reduce tasks
+	EndTaskType     TaskType = 3 // can exit on this
+)
+
+func (e TaskType) String() string {
+	switch e {
+	case MapTaskType:
+		return "MapTaskType"
+	case ReduceTaskType:
+		return "ReduceTaskType"
+	case WaitingTaskType:
+		return "WaitingTaskType"
+	case EndTaskType:
+		return "EndTaskType"
+	default:
+		return fmt.Sprintf("%d", int(e))
+	}
+}
+
+type GetTaskArgs struct {
+}
+
+type GetTaskReply struct {
+	TaskType TaskType
+
+	// For map
+	FileNumberX int
+	InputFile   string
+	NReduce     int
+
+	// For reduce
+	FileNumberY int
+	ReduceFiles []string
+}
+
+// Finish task
+type FinishTaskArgs struct {
+	TaskType TaskType
+	// for map
+	FileNumberX int
+	InputFile   string
+	NReduce     int
+
+	// for reduce
+	FileNumberY int
+	ReduceFiles []string
+}
+
+type FinishTaskReply struct {
+	MoreTask bool
+}
+
+// ------------------------------ Examples below ----------------------------------------
 
 //
 // example to show how to declare the arguments
@@ -23,7 +85,6 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
-
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
