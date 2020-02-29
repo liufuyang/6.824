@@ -30,6 +30,7 @@ type GetTaskReply struct {
 	NReduce int
 
 	// For reduce
+	FileNumberY int
 	ReduceFiles []string
 }
 
@@ -40,6 +41,9 @@ type FinishTaskArgs struct {
 	FileNumberX int
 	InputFile string
 	NReduce int
+
+	// for reduce
+	FileNumberY int
 	ReduceFiles []string
 }
 

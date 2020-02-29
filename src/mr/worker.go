@@ -44,22 +44,47 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 	id := RandStringRunes(5)
 
+Loop:
 	for {
 		// uncomment to send the Example RPC to the master.
 		task := GetTask(id)
-		if task.TaskType == MapTaskType {
-			reduceFiles := doMap(task.FileNumberX, task.InputFile, task.NReduce, mapf)
-			if reduceFiles == nil {
-				// do map failed, continue immediately
-				continue
+		switch task.TaskType {
+		case MapTaskType:
+			{
+				reduceFiles := doMap(task.FileNumberX, task.InputFile, task.NReduce, mapf)
+				if reduceFiles == nil {
+					// do map failed, continue immediately
+					continue
+				}
+				// report map task result
+				mapFinishReply := FinishTask(id, task.TaskType, task.FileNumberX, -1, reduceFiles)
+				if mapFinishReply.MoreTask {
+					continue
+				} else {
+					break
+				}
 			}
-			// task map job result
-			mapFinishReply := FinishTask(id, task.TaskType, task.FileNumberX, 0, reduceFiles)
-			if mapFinishReply.MoreTask {
-				continue
-			} else {
-				break
+		case ReduceTaskType:
+			{
+				err := doReduce(task.FileNumberY, task.ReduceFiles, reducef)
+				if err != nil {
+					// do reduce failed, continue immediately
+					continue
+				}
+				// report reduce task result
+				mapFinishReply := FinishTask(id, task.TaskType, -1, task.FileNumberY, nil)
+				if mapFinishReply.MoreTask {
+					continue
+				} else {
+					break
+				}
 			}
+		case NoMapTaskType:
+			time.Sleep(5 * time.Second)
+			continue
+		case EndTaskType:
+			fmt.Printf("Worker %v done. \n", id)
+			break Loop
 		}
 	}
 }
@@ -68,7 +93,8 @@ func GetTask(id string) GetTaskReply {
 	args := GetTaskArgs{}
 	reply := GetTaskReply{}
 	call("Master.GetTask", &args, &reply)
-	fmt.Printf("Worker %v - %v - input file: %v\n", id, reply.TaskType, reply.InputFile)
+	fmt.Printf("Worker %v - TYPE-%v - [X: %v Y: %v] - map file name: %v - reduce file len: %v -  %v \n",
+		id, reply.TaskType, reply.FileNumberX, reply.FileNumberY, reply.InputFile, len(reply.ReduceFiles), reply.ReduceFiles)
 
 	return reply
 }
@@ -96,10 +122,12 @@ func doMap(X int, filename string, nReduce int, mapf func(string, string) []KeyV
 
 	// write
 	reduceFiles := []string{}
+
 	for Y, kva := range intermediate {
-		oname := fmt.Sprintf("mr-%v-%v.json", X, Y)
+		oname := fmt.Sprintf("mr-%v-%v", X, Y)
 		ofile, _ := os.Create(oname)
 		reduceFiles = append(reduceFiles, oname)
+
 		enc := json.NewEncoder(ofile)
 		for _, kv := range kva {
 			err := enc.Encode(&kv)
@@ -112,14 +140,67 @@ func doMap(X int, filename string, nReduce int, mapf func(string, string) []KeyV
 		ofile.Close()
 	}
 
+
 	// report back to master
 	return reduceFiles
+}
+
+func doReduce(Y int, reduceFiles []string, reducef func(string, []string) string) error {
+	kva := []KeyValue{}
+	for _, filename := range reduceFiles {
+
+		file, err := os.Open(filename)
+		if err != nil {
+			log.Fatalf("doReduce cannot open %v", filename)
+			return err
+		}
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+	}
+
+	sort.Sort(ByKey(kva))
+
+	// Merge
+	reduceMap := make(map[string][]string)
+	for _, kv := range kva {
+		reduceMap[kv.Key] = append(reduceMap[kv.Key], kv.Value)
+	}
+
+	// Write
+	// To order the keys again
+	var keys []string
+	for k, _ := range reduceMap {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	oname := fmt.Sprintf("mr-out-%v", Y)
+	ofile, err := os.Create(oname)
+	if err != nil {
+		return err
+	}
+
+	for _, k := range keys {
+		value := reducef(k, reduceMap[k])
+		fmt.Fprintf(ofile, "%v %v\n", k, value)
+	}
+	ofile.Close()
+
+	return nil
 }
 
 func FinishTask(id string, taskType TaskType, X int, Y int, reduceFiles []string) FinishTaskReply {
 	args := FinishTaskArgs{
 		TaskType:    taskType,
 		FileNumberX: X,
+		FileNumberY: Y,
 		ReduceFiles: reduceFiles,
 	}
 	reply := FinishTaskReply{}
