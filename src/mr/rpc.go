@@ -13,7 +13,8 @@ type TaskType int
 const (
 	MapTaskType TaskType = 0
 	ReduceTaskType TaskType = 1
-	NoTaskType TaskType = 2
+	NoMapTaskType TaskType = 2 // continue get reduce tasks
+	EndTaskType  TaskType = 3 // can exit on this
 )
 
 type GetTaskArgs struct {
@@ -22,13 +23,30 @@ type GetTaskArgs struct {
 
 type GetTaskReply struct {
 	TaskType TaskType
+
 	// For map
 	FileNumberX int
 	InputFile string
+	NReduce int
 
 	// For reduce
 	ReduceFiles []string
 }
+
+// Finish task
+type FinishTaskArgs struct {
+	TaskType TaskType
+	// for map
+	FileNumberX int
+	InputFile string
+	NReduce int
+	ReduceFiles []string
+}
+
+type FinishTaskReply struct {
+	MoreTask bool
+}
+
 
 // ------------------------------ Examples below ----------------------------------------
 

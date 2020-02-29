@@ -1,4 +1,5 @@
 mr-out-*
+mr-*
 *.so
 mrmaster
 mrworker

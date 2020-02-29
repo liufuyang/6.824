@@ -2,6 +2,7 @@ package mr
 
 import (
 	"log"
+	"time"
 )
 import "net"
 import "os"
@@ -13,17 +14,25 @@ type Master struct {
 	nReduce     int
 	mapTasks    []MapTask
 	reduceTasks []ReduceTask
-
-	allDone bool
 }
 
+type TaskStatus int
+const (
+	Idle TaskStatus = 0
+	InProgress TaskStatus = 1
+	Done TaskStatus = 2
+)
+
 type MapTask struct {
-	done bool
+	status TaskStatus
+	timeStart time.Time
 	file string
 }
 
 type ReduceTask struct {
-	done bool
+	status TaskStatus
+	timeStart time.Time
+	ReduceFiles []string
 }
 
 // Your code here -- RPC handlers for the worker to call.
@@ -32,15 +41,20 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 
 	// Do map tasks
 	for X, mapTask := range m.mapTasks {
-		if !mapTask.done {
+		if mapTask.status == Idle {
 			reply.TaskType = MapTaskType
 			reply.FileNumberX = X
 			reply.InputFile = mapTask.file
+			reply.NReduce = m.nReduce
+
+			mapTask.timeStart = time.Now()
+			mapTask.status = InProgress
 			return nil
 		}
 	}
 
 	// Do reduce tasks
+	// Only when map task all done
 	//for Y, reduceTask := range m.reduceTasks {
 	//	if !reduceTask.done {
 	//		reply.TaskType = ReduceTaskType
@@ -50,9 +64,22 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	//}
 
 	// reaching here means all done
-	reply.TaskType = NoTaskType
+	if m.Done() {
+		reply.TaskType = EndTaskType
+	} else {
+		reply.TaskType = NoMapTaskType
+	}
+	return nil
+}
 
-	m.allDone = true
+
+func (m *Master) FinishTask(args *FinishTaskArgs, reply *FinishTaskReply) error {
+	if args.TaskType == MapTaskType {
+		m.mapTasks[args.FileNumberX].status = Done
+		m.reduceTasks[args.NReduce].ReduceFiles = args.ReduceFiles
+		reply.MoreTask = !m.Done()
+	}
+
 	return nil
 }
 
@@ -80,6 +107,20 @@ func (m *Master) Done() bool {
 	ret := false
 
 	// Your code here.
+	// Do map tasks
+	for _, mapTask := range m.mapTasks {
+		switch mapTask.status {
+		case Done:
+			continue
+		case InProgress:
+			if time.Now().After(mapTask.timeStart.Add(10*time.Second)) {
+				mapTask.status = Idle
+				return false
+			}
+		case Idle:
+			return false
+		}
+	}
 
 	return ret
 }
@@ -92,13 +133,12 @@ func (m *Master) Done() bool {
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{
 		nReduce: nReduce,
-		allDone: false,
 	}
 
 	var mapTasks []MapTask
 	for _, file := range files {
 		var task = MapTask{
-			done: false,
+			status: Idle,
 			file: file,
 		}
 		mapTasks = append(mapTasks, task)
@@ -107,7 +147,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 
 	var reduceTasks []ReduceTask
 	for i := 0; i < nReduce; i++ {
-		var task = ReduceTask{done: false}
+		var task = ReduceTask{status: Idle}
 		reduceTasks = append(reduceTasks, task)
 	}
 	m.reduceTasks = reduceTasks
