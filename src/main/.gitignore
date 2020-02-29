@@ -1,0 +1,7 @@
+mr-out-*
+mr-*
+*.so
+mrmaster
+mrworker
+mrsequential
+mr-tmp
