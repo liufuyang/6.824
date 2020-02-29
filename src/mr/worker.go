@@ -79,7 +79,7 @@ Loop:
 					break
 				}
 			}
-		case NoMapTaskType:
+		case WaitingTaskType:
 			time.Sleep(5 * time.Second)
 			continue
 		case EndTaskType:

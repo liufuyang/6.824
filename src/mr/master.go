@@ -56,6 +56,7 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		if mapTask.status == Idle {
 			reply.TaskType = MapTaskType
 			reply.FileNumberX = X
+			reply.FileNumberY = -1
 			reply.InputFile = mapTask.file
 			reply.NReduce = m.nReduce
 
@@ -68,7 +69,9 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 
 	// Let worker wait for all map task done
 	if !m.allMapDone() {
-		reply.TaskType = NoMapTaskType
+		reply.TaskType = WaitingTaskType
+		reply.FileNumberX = -2
+		reply.FileNumberY = -2
 		return nil
 	}
 
@@ -81,6 +84,7 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		if reduceTask.status == Idle {
 			reply.TaskType = ReduceTaskType
 			reply.FileNumberY = Y
+			reply.FileNumberX = -1
 			reply.ReduceFiles = m.reduceFiles[strconv.Itoa(Y)]
 
 			reduceTask.timeStart = time.Now()
@@ -99,8 +103,12 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	// reaching here means all done
 	if m.Done() {
 		reply.TaskType = EndTaskType
+		reply.FileNumberX = -3
+		reply.FileNumberY = -3
 	} else {
-		reply.TaskType = NoMapTaskType
+		reply.TaskType = WaitingTaskType
+		reply.FileNumberX = -2
+		reply.FileNumberY = -2
 	}
 	return nil
 
@@ -183,7 +191,6 @@ func (m *Master) Done() bool {
 			return false
 		}
 	}
-
 	return true
 }
 
