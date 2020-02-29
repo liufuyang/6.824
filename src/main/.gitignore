@@ -1,2 +1,6 @@
-mr-out-0
+mr-out-*
 *.so
+mrmaster
+mrworker
+mrsequential
+mr-tmp

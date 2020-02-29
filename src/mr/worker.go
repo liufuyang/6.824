@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
+import (
+	"fmt"
+	"time"
+)
 import "log"
 import "net/rpc"
 import "hash/fnv"
+import "math/rand"
 
+func init() {
+	rand.Seed(time.Now().UnixNano())
+}
 
 //
 // Map functions return a slice of KeyValue.
@@ -32,11 +39,34 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	id := RandStringRunes(5)
 
 	// uncomment to send the Example RPC to the master.
-	// CallExample()
+	GetTask(id)
 
 }
+
+func GetTask(id string) {
+	args := GetTaskArgs{}
+	reply := GetTaskReply{}
+	call("Master.GetTask", &args, &reply)
+
+	fmt.Printf("Worker %v - %v - input file: %v", id, reply.TaskType, reply.InputFile)
+}
+
+// ------------------------------ Helper functions --------------------------------------
+var letterRunes = []rune("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+func RandStringRunes(n int) string {
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letterRunes[rand.Intn(len(letterRunes))]
+	}
+	return string(b)
+}
+
+// ------------------------------ Examples below ----------------------------------------
+
 
 //
 // example function to show how to make an RPC call to the master.
