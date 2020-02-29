@@ -1,7 +1,6 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"strconv"
 	"strings"
@@ -90,12 +89,6 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 			reduceTask.timeStart = time.Now()
 			reduceTask.status = InProgress
 
-			// TODO - test output
-			for Y, _ := range m.reduceFiles{
-				fmt.Printf("Test output using reduce files Y:%v len:%v  %v \n",
-					Y, len(m.reduceFiles[Y]), m.reduceFiles[Y])
-			}
-
 			return nil
 		}
 	}
@@ -128,12 +121,6 @@ func (m *Master) FinishTask(args *FinishTaskArgs, reply *FinishTaskReply) error 
 				partition := m.reduceFiles[Y]
 				partition = append(partition, reduceFile)
 				m.reduceFiles[Y] = partition
-			}
-
-			// TODO - test output
-			for Y, _ := range m.reduceFiles{
-				fmt.Printf("Test output creating reduce files Y:%v len:%v  %v \n",
-					Y, len(m.reduceFiles[Y]), m.reduceFiles[Y])
 			}
 
 			reply.MoreTask = !m.Done()

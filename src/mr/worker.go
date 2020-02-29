@@ -44,7 +44,7 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 	id := RandStringRunes(5)
 
-Loop:
+Loop: // add "Loop" here to allow break to it from inner switch block
 	for {
 		// uncomment to send the Example RPC to the master.
 		task := GetTask(id)
@@ -61,7 +61,7 @@ Loop:
 				if mapFinishReply.MoreTask {
 					continue
 				} else {
-					break
+					break Loop
 				}
 			}
 		case ReduceTaskType:
@@ -76,23 +76,24 @@ Loop:
 				if mapFinishReply.MoreTask {
 					continue
 				} else {
-					break
+					break Loop
 				}
 			}
 		case WaitingTaskType:
 			time.Sleep(5 * time.Second)
 			continue
 		case EndTaskType:
-			fmt.Printf("Worker %v done. \n", id)
 			break Loop
 		}
 	}
+
+	fmt.Printf("Worker %v done. \n", id)
 }
 
 func GetTask(id string) GetTaskReply {
 	args := GetTaskArgs{}
 	reply := GetTaskReply{}
-	call("Master.GetTask", &args, &reply)
+	call(id, "Master.GetTask", &args, &reply)
 	fmt.Printf("Worker %v - TYPE-%v - [X: %v Y: %v] - map file name: %v - reduce file len: %v -  %v \n",
 		id, reply.TaskType, reply.FileNumberX, reply.FileNumberY, reply.InputFile, len(reply.ReduceFiles), reply.ReduceFiles)
 
@@ -139,7 +140,6 @@ func doMap(X int, filename string, nReduce int, mapf func(string, string) []KeyV
 		}
 		ofile.Close()
 	}
-
 
 	// report back to master
 	return reduceFiles
@@ -204,7 +204,7 @@ func FinishTask(id string, taskType TaskType, X int, Y int, reduceFiles []string
 		ReduceFiles: reduceFiles,
 	}
 	reply := FinishTaskReply{}
-	call("Master.FinishTask", &args, &reply)
+	call(id, "Master.FinishTask", &args, &reply)
 	fmt.Printf("Worker %v - %v - finished - moreTask %v \n", id, args.TaskType, reply.MoreTask)
 
 	return reply
@@ -248,7 +248,7 @@ func CallExample() {
 	reply := ExampleReply{}
 
 	// send the RPC request, wait for the reply.
-	call("Master.Example", &args, &reply)
+	call("", "Master.Example", &args, &reply)
 
 	// reply.Y should be 100.
 	fmt.Printf("reply.Y %v\n", reply.Y)
@@ -259,12 +259,13 @@ func CallExample() {
 // usually returns true.
 // returns false if something goes wrong.
 //
-func call(rpcname string, args interface{}, reply interface{}) bool {
+func call(id string, rpcname string, args interface{}, reply interface{}) bool {
 	// c, err := rpc.DialHTTP("tcp", "127.0.0.1"+":1234")
 	sockname := masterSock()
 	c, err := rpc.DialHTTP("unix", sockname)
 	if err != nil {
-		log.Fatal("dialing:", err)
+		fmt.Printf("Worker %v - Connection to master lost\nWorker %v done. \n", id, id)
+		log.Fatal("dialing: ", err)
 	}
 	defer c.Close()
 
