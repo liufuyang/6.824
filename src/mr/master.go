@@ -41,7 +41,20 @@ type ReduceTask struct {
 	timeStart time.Time
 }
 
-// Your code here -- RPC handlers for the worker to call.
+/*
+	Your code here -- RPC handlers for the worker to call.
+	As we define the intermediate files name as `mr-X-Y` and final output file names as `mr-out-Y`
+
+	We use
+		* `X` to define the file number for map function input
+		* `Y` to define the file number for reduce function grouped input
+
+	For example:
+	If after map phase, worker1 generate files [mr-0-1, mr-0-2],
+	and worker2 generate files [mr-1-1, mr-1-2] (when setting nReduce=2)
+	Then at reduce phase, one worker will handle files [mr-0-1, mr-1-1],
+	another worker will handle files [mr-0-2, mr-1-2].
+ */
 
 func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 
@@ -66,7 +79,7 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 		}
 	}
 
-	// Let worker wait for all map task done
+	// Let worker wait for all map tasks done
 	if !m.allMapDone() {
 		reply.TaskType = WaitingTaskType
 		reply.FileNumberX = -2
@@ -75,8 +88,7 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 	}
 
 	// Do reduce tasks
-	// Only when map task all done
-
+	// Only when map task all done (checked above)
 	for Y, _ := range m.reduceTasks {
 		reduceTask := &m.reduceTasks[Y] // get reference instead of copy!
 
