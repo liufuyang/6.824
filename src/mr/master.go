@@ -19,16 +19,7 @@ type Master struct {
 	nReduce     int
 	mapTasks    []MapTask
 	reduceTasks []ReduceTask
-	reduceFiles map[string][]string
 }
-
-type TaskStatus int
-
-const (
-	Idle       TaskStatus = 0
-	InProgress TaskStatus = 1
-	Done       TaskStatus = 2
-)
 
 type MapTask struct {
 	status    TaskStatus
@@ -39,7 +30,16 @@ type MapTask struct {
 type ReduceTask struct {
 	status    TaskStatus
 	timeStart time.Time
+	files     []string
 }
+
+type TaskStatus int
+
+const (
+	Idle       TaskStatus = 0
+	InProgress TaskStatus = 1
+	Done       TaskStatus = 2
+)
 
 /*
 	Your code here -- RPC handlers for the worker to call.
@@ -54,7 +54,7 @@ type ReduceTask struct {
 	and worker2 generate files [mr-1-1, mr-1-2] (when setting nReduce=2)
 	Then at reduce phase, one worker will handle files [mr-0-1, mr-1-1],
 	another worker will handle files [mr-0-2, mr-1-2].
- */
+*/
 
 func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 
@@ -96,7 +96,7 @@ func (m *Master) GetTask(args *GetTaskArgs, reply *GetTaskReply) error {
 			reply.TaskType = ReduceTaskType
 			reply.FileNumberY = Y
 			reply.FileNumberX = -1
-			reply.ReduceFiles = m.reduceFiles[strconv.Itoa(Y)]
+			reply.ReduceFiles = reduceTask.files
 
 			reduceTask.timeStart = time.Now()
 			reduceTask.status = InProgress
@@ -129,10 +129,13 @@ func (m *Master) FinishTask(args *FinishTaskArgs, reply *FinishTaskReply) error 
 			m.mapTasks[args.FileNumberX].status = Done
 			for _, reduceFile := range args.ReduceFiles {
 				parts := strings.Split(reduceFile, "-")
-				Y := parts[len(parts)-1]
-				partition := m.reduceFiles[Y]
+				Y, err := strconv.Atoi(parts[len(parts)-1])
+				if err != nil {
+					log.Fatal("Map output file name not ending with int: ", err)
+				}
+				partition := m.reduceTasks[Y].files
 				partition = append(partition, reduceFile)
-				m.reduceFiles[Y] = partition
+				m.reduceTasks[Y].files = partition
 			}
 
 			reply.MoreTask = !m.Done()
@@ -219,9 +222,8 @@ func (m *Master) allMapDone() bool {
 //
 func MakeMaster(files []string, nReduce int) *Master {
 	m := Master{
-		nReduce:     nReduce,
-		reduceFiles: make(map[string][]string),
-		mutex:       sync.Mutex{},
+		nReduce: nReduce,
+		mutex:   sync.Mutex{},
 	}
 
 	var mapTasks []MapTask
@@ -236,7 +238,7 @@ func MakeMaster(files []string, nReduce int) *Master {
 
 	var reduceTasks []ReduceTask
 	for i := 0; i < nReduce; i++ {
-		var task = ReduceTask{status: Idle}
+		var task = ReduceTask{status: Idle, files: []string{}}
 		reduceTasks = append(reduceTasks, task)
 	}
 	m.reduceTasks = reduceTasks
