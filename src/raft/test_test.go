@@ -7,6 +7,8 @@ package raft
 // so, while you can modify this code to help you debug, please
 // test with the original before submitting.
 //
+// go test -race -run 2A
+//
 
 import "testing"
 import "fmt"

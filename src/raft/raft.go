@@ -202,6 +202,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			// a new term comes, setting it as follower
 			rf.stepDownAsFollower(args.Term)
 		}
+		if args.Term == rf.term && rf.state == Candidate {
+			reply.Agree = false
+			reply.Term = rf.term
+			return
+		}
 		notYetVoted := rf.votedFor == -1
 		votedTheSameBefore := rf.votedFor == args.From
 		if notYetVoted || votedTheSameBefore {

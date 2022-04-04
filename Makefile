@@ -19,6 +19,8 @@ LABS=" lab1 lab2a lab2b lab2c lab2d lab3a lab3b lab4a lab4b "
 			"--exclude=src/main/mrcoordinator" \
 			"--exclude=src/main/mrsequential" \
 			"--exclude=src/main/mrworker" \
+			"--exclude=src/basic-goroutines"  \
+			"--exclude=src/basic-go-channels"  \
 			"--exclude=*.so" \
 			Makefile src; \
 		if ! test -e api.key ; then \
