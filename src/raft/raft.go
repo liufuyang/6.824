@@ -74,7 +74,7 @@ type Raft struct {
 	electionTimeoutTime   time.Time
 	heartsBeatDuration    time.Duration
 	candidateStartingTime time.Time
-	votedAsFollower       bool
+	votedFor              int
 }
 
 type ServerState int
@@ -191,7 +191,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Printf("%v Got vote request from %v - term: %v, currentTerm: %v, state: %v\n", rf.me, args.From, args.Term, rf.term, rf.state)
+	fmt.Printf("Node %v - Got **VoteRequest** from %v - term: %v, currentTerm: %v, votedFor: %v state: %v\n", rf.me, args.From, args.Term, rf.term, rf.votedFor, rf.state)
 	if args.Term < rf.term {
 		reply.Agree = false
 		return
@@ -205,15 +205,21 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Agree = false
 			return
 		}
-		if rf.state == Follower && rf.votedAsFollower {
-			reply.Agree = false // stop double voting
-			return
-		}
+		// must be follower below
 	}
+	// a new term comes, setting it as follower
 	rf.state = Follower
-	// when voting, do not increase term
-	rf.votedAsFollower = true
-	reply.Agree = true
+	// when voting, do increase term?
+	rf.term = args.Term
+	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration()) // sleep after vote
+	if rf.votedFor == -1 || rf.votedFor == args.From {
+		rf.votedFor = args.From
+		reply.Agree = true
+		fmt.Printf("Node %v - Got **VoteRequest** from %v and vote True, votedFor: %v \n", rf.me, args.From, rf.votedFor)
+	} else {
+		reply.Agree = false
+		fmt.Printf("Node %v - Got **VoteRequest** from %v and vote False, votedFor: %v \n", rf.me, args.From, rf.votedFor)
+	}
 	return
 }
 
@@ -228,7 +234,7 @@ type HeartBeatReply struct {
 func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	fmt.Printf("%v Got heatsBeat from %v - term: %v, currentTerm: %v, state: %v\n", rf.me, args.From, args.Term, rf.term, rf.state)
+	// fmt.Printf("%v Got heatsBeat from %v - term: %v, currentTerm: %v, state: %v\n", rf.me, args.From, args.Term, rf.term, rf.state)
 	// While waiting for votes, a candidate may receive an
 	// AppendEntries RPC from another server claiming to be
 	// leader. If the leader’s term (included in its RPC) is at least
@@ -238,12 +244,15 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	// current term, then the candidate rejects the RPC and continues in candidate state.
 	if args.Term >= rf.term {
 		rf.state = Follower
+		rf.votedFor = args.From
 		rf.term = args.Term
 		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 		reply.Good = true
+		fmt.Printf("Node %v -> [HeatsBeat] from %v - term: %v, currentTerm: %v, state: %v, --- Reply to %v\n", rf.me, args.From, args.Term, rf.term, rf.state, args.From)
 		return
 	} else {
 		reply.Good = false
+		fmt.Printf("Node %v -> [HeatsBeat] from %v - term: %v, currentTerm: %v, state: %v, --- Ignore to %v\n", rf.me, args.From, args.Term, rf.term, rf.state, args.From)
 		return // ignore
 	}
 }
@@ -344,7 +353,7 @@ func (rf *Raft) ticker() {
 			continue
 		}
 
-		fmt.Printf("%v DEBUG ticker - term: %v ;state: %v\n", rf.me, rf.term, rf.state)
+		fmt.Printf("Node %v as %v - DEBUG ticker - term: %v ;\n", rf.me, rf.state, rf.term)
 		if rf.state == Leader {
 			fmt.Printf("Leader %v sends heartsbeat to others... \n", rf.me)
 
@@ -394,6 +403,7 @@ func (rf *Raft) ticker() {
 				// leader doesn't get enough heartbeats from most of the candidate, step down
 				fmt.Printf("Leader %v got heartbeat count: %v - setting back to follower\n", rf.me, heartBeatCount)
 				rf.state = Follower
+				rf.votedFor = -1
 				rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 			}
 			rf.mu.Unlock()
@@ -401,15 +411,20 @@ func (rf *Raft) ticker() {
 		} else if rf.state == Follower {
 			rf.term = rf.term + 1 // --------- only place that bumps term ------------
 			rf.state = Candidate
+			rf.votedFor = -1
 			rf.candidateStartingTime = time.Now()
+			fmt.Printf("----- %v step up as candidate -----\n", rf.me)
 		} else if rf.state == Candidate {
 			//  A candidate continues in this state until one of three things happens:
 			//  (a) it wins the election,
 			//  (b) another server establishes itself as leader, or
 			//  (c) a period of time goes by with no winner
 
-			if time.Now().After(rf.candidateStartingTime.Add(2 * rf.getElectionTimeoutDuration())) {
+			if time.Now().After(rf.candidateStartingTime.Add(rf.getElectionTimeoutDuration())) {
+				fmt.Printf("----- %v step dowm from candidate to follower as timeout -----\n", rf.me)
 				rf.state = Follower
+				rf.votedFor = -1
+				rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 				rf.mu.Unlock()
 				continue
 			}
@@ -454,6 +469,13 @@ func (rf *Raft) ticker() {
 
 			wg.Wait()
 			rf.mu.Lock()
+
+			if rf.state == Follower { // check whether this candidate has been set back to Follower
+				rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+				rf.mu.Unlock()
+				continue
+			}
+
 			fmt.Printf("Node %v got vote count %v\n", rf.me, voteCount)
 			if voteCount >= len(rf.peers)/2+1 {
 				fmt.Printf("------L------ Setting %v as Leader\n", rf.me)
@@ -489,6 +511,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.followerTimeout = time.Millisecond * 150 // Follower Time Out
 	rf.state = Follower
+	rf.votedFor = -1
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration
