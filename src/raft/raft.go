@@ -242,6 +242,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		rf.votedFor = args.From
 		rf.term = args.Term
 		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+
 		reply.Good = true
 		reply.Term = rf.term
 		fmt.Printf("Node %v -> [HeatsBeat] from %v - term: %v, currentTerm: %v, state: %v, --- Reply to %v\n", rf.me, args.From, args.Term, rf.term, rf.state, args.From)
@@ -352,59 +353,8 @@ func (rf *Raft) ticker() {
 
 		fmt.Printf("Node %v as %v - DEBUG ticker - term: %v ;\n", rf.me, rf.state, rf.term)
 		if rf.state == Leader {
-			fmt.Printf("Leader %v sends heartsbeat term %v to others... \n", rf.me, rf.term)
-
-			c1 := make(chan int)
-
-			for i, other := range rf.peers {
-				peer := other // needed for solving datarace
-				if i != rf.me {
-					var args *HeartBeatRequest = &HeartBeatRequest{
-						From: rf.me,
-						Term: rf.term,
-					}
-					var reply *HeartBeatReply = &HeartBeatReply{}
-					go func() {
-						if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
-							if reply.Good {
-								c1 <- 1
-								return
-							}
-						}
-						c1 <- 0
-						fmt.Printf("Leader %v sends heartsbeat term %v to %v failed\n", args.From, args.Term, i)
-					}()
-				}
-			}
 			rf.mu.Unlock()
-
-			heartBeatCount := 1 // vote for myself
-			needToLoop := true
-			for i, _ := range rf.peers {
-				if i != rf.me && needToLoop {
-					select {
-					case vote := <-c1:
-						heartBeatCount = heartBeatCount + vote
-					}
-					if heartBeatCount >= len(rf.peers)/2+1 {
-						needToLoop = false
-						continue
-					}
-				}
-			}
-			rf.mu.Lock()
-
-			if heartBeatCount >= len(rf.peers)/2+1 {
-				fmt.Printf("Leader %v got heartbeat count: %v - keep being leader\n", rf.me, heartBeatCount)
-				rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
-			} else {
-				// leader doesn't get enough heartbeats from most of the candidate, step down
-				fmt.Printf("Leader %v got heartbeat count: %v - setting back to follower\n", rf.me, heartBeatCount)
-				rf.state = Follower
-				rf.votedFor = -1
-				rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-			}
-			rf.mu.Unlock()
+			rf.tickerAsLeader()
 			continue
 		} else if rf.state == Follower {
 			rf.term = rf.term + 1 // --------- only place that bumps term ------------
@@ -412,79 +362,140 @@ func (rf *Raft) ticker() {
 			rf.votedFor = -1
 			rf.candidateStartingTime = time.Now()
 			fmt.Printf("----- %v step up as candidate -----\n", rf.me)
-		} else if rf.state == Candidate {
-			//  A candidate continues in this state until one of three things happens:
-			//  (a) it wins the election,
-			//  (b) another server establishes itself as leader, or
-			//  (c) a period of time goes by with no winner
-
-			if time.Now().After(rf.candidateStartingTime.Add(rf.getElectionTimeoutDuration())) {
-				fmt.Printf("----- %v step dowm from candidate to follower as timeout -----\n", rf.me)
-				rf.state = Follower
-				rf.votedFor = -1
-				rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-				rf.mu.Unlock()
-				continue
-			}
-
-			c1 := make(chan int)
-			for i, other := range rf.peers {
-				if i != rf.me {
-					peer := other
-					var args *RequestVoteArgs = &RequestVoteArgs{
-						From: rf.me,
-						Term: rf.term,
-					}
-					var reply *RequestVoteReply = &RequestVoteReply{}
-					go func() {
-						//fmt.Printf("--- go func --- start \n")
-						if ok := peer.Call("Raft.RequestVote", args, reply); ok {
-							if reply.Agree {
-								c1 <- 1
-								//fmt.Printf("--- go func --- end \n")
-								return
-							}
-						}
-						c1 <- 0
-						// fmt.Printf("--- go func --- end \n")
-					}()
-				}
-			}
 			rf.mu.Unlock()
+			continue
+		} else if rf.state == Candidate {
+			rf.mu.Unlock()
+			rf.tickerAsCandidate()
+			continue
+		}
 
-			voteCount := 1 // vote for myself
-			needToLoop := true
-			for i, _ := range rf.peers {
-				if i != rf.me && needToLoop {
-					select {
-					case vote := <-c1:
-						voteCount = voteCount + vote
-					}
-					if voteCount >= len(rf.peers)/2+1 {
-						needToLoop = false // IMPORTANT - do not wait for other remote calls if we already connected enough votes. Otherwise, it makes tests timeout
-						continue
+	}
+}
+
+func (rf *Raft) tickerAsLeader() {
+	fmt.Printf("Leader %v sends heartsbeat term %v to others... \n", rf.me, rf.term)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	c1 := make(chan int)
+
+	for i, other := range rf.peers {
+		peer := other // needed for solving datarace
+		if i != rf.me {
+			var args *HeartBeatRequest = &HeartBeatRequest{
+				From: rf.me,
+				Term: rf.term,
+			}
+			var reply *HeartBeatReply = &HeartBeatReply{}
+			go func() {
+				if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
+					if reply.Good {
+						c1 <- 1
+						return
 					}
 				}
+				c1 <- 0
+				fmt.Printf("Leader %v sends heartsbeat term %v to %v failed\n", args.From, args.Term, i)
+			}()
+		}
+	}
+	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
+	heartBeatCount := 1 // vote for myself
+	needToLoop := true
+	for i, _ := range rf.peers {
+		if i != rf.me && needToLoop {
+			select {
+			case vote := <-c1:
+				heartBeatCount = heartBeatCount + vote
 			}
-
-			rf.mu.Lock()
-
-			if rf.state == Follower { // check whether this candidate has been set back to Follower
-				fmt.Printf("Node %v set back to Follower while trying to get vote as Candidate\n", rf.me)
-				rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-				rf.mu.Unlock()
+			if heartBeatCount >= len(rf.peers)/2+1 {
+				needToLoop = false
 				continue
-			}
-
-			fmt.Printf("Node %v got vote count %v\n", rf.me, voteCount)
-			if voteCount >= len(rf.peers)/2+1 {
-				fmt.Printf("------L------ Setting %v as Leader\n", rf.me)
-				rf.state = Leader
-			} else {
-				rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 			}
 		}
-		rf.mu.Unlock()
+	}
+	rf.mu.Lock()
+
+	if heartBeatCount >= len(rf.peers)/2+1 {
+		fmt.Printf("Leader %v got heartbeat count: %v - keep being leader\n", rf.me, heartBeatCount)
+		rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
+	} else {
+		// leader doesn't get enough heartbeats from most of the candidate, step down
+		fmt.Printf("Leader %v got heartbeat count: %v - setting back to follower\n", rf.me, heartBeatCount)
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+	}
+}
+func (rf *Raft) tickerAsCandidate() {
+	//  A candidate continues in this state until one of three things happens:
+	//  (a) it wins the election,
+	//  (b) another server establishes itself as leader, or
+	//  (c) a period of time goes by with no winner
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if time.Now().After(rf.candidateStartingTime.Add(rf.getElectionTimeoutDuration())) {
+		fmt.Printf("----- %v step dowm from candidate to follower as timeout -----\n", rf.me)
+		rf.state = Follower
+		rf.votedFor = -1
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		return
+	}
+
+	c1 := make(chan int)
+	for i, other := range rf.peers {
+		if i != rf.me {
+			peer := other
+			var args *RequestVoteArgs = &RequestVoteArgs{
+				From: rf.me,
+				Term: rf.term,
+			}
+			var reply *RequestVoteReply = &RequestVoteReply{}
+			go func() {
+				//fmt.Printf("--- go func --- start \n")
+				if ok := peer.Call("Raft.RequestVote", args, reply); ok {
+					if reply.Agree {
+						c1 <- 1
+						//fmt.Printf("--- go func --- end \n")
+						return
+					}
+				}
+				c1 <- 0
+				// fmt.Printf("--- go func --- end \n")
+			}()
+		}
+	}
+	rf.mu.Unlock()
+	voteCount := 1 // vote for myself
+	needToLoop := true
+	for i, _ := range rf.peers {
+		if i != rf.me && needToLoop {
+			select {
+			case vote := <-c1:
+				voteCount = voteCount + vote
+			}
+			if voteCount >= len(rf.peers)/2+1 {
+				needToLoop = false // IMPORTANT - do not wait for other remote calls if we already connected enough votes. Otherwise, it makes tests timeout
+				continue
+			}
+		}
+	}
+	rf.mu.Lock()
+
+	// check whether this candidate has been set back to Follower
+	if rf.state == Follower {
+		fmt.Printf("Node %v set back to Follower while trying to get vote as Candidate\n", rf.me)
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		return
+	}
+
+	fmt.Printf("Node %v got vote count %v\n", rf.me, voteCount)
+	if voteCount >= len(rf.peers)/2+1 {
+		fmt.Printf("------L------ Setting %v as Leader\n", rf.me)
+		rf.state = Leader
+	} else {
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 	}
 }
 
