@@ -201,6 +201,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if args.Term > rf.term {
 			// a new term comes, setting it as follower
 			rf.state = Follower
+			rf.votedFor = -1                                                         // IMPORTANT - need to clean votedFor when step down
 			rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration()) // sleep after vote
 		}
 		notYetVoted := rf.votedFor == -1
@@ -460,7 +461,7 @@ func (rf *Raft) ticker() {
 						voteCount = voteCount + vote
 					}
 					if voteCount >= len(rf.peers)/2+1 {
-						needToLoop = false
+						needToLoop = false // IMPORTANT - do not wait for other remote calls if we already connected enough votes. Otherwise, it makes tests timeout
 						continue
 					}
 				}
