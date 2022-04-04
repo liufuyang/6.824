@@ -182,6 +182,7 @@ type RequestVoteArgs struct {
 type RequestVoteReply struct {
 	// Your data here (2A).
 	Agree bool
+	Term  int
 }
 
 //
@@ -194,33 +195,25 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	fmt.Printf("Node %v - Got **VoteRequest** from %v - term: %v, currentTerm: %v, votedFor: %v state: %v\n", rf.me, args.From, args.Term, rf.term, rf.votedFor, rf.state)
 	if args.Term < rf.term {
 		reply.Agree = false
+		reply.Term = rf.term
 		return
-	}
-	if args.Term == rf.term {
-		if rf.state == Leader {
-			reply.Agree = false
-			return
-		}
-		if rf.state == Candidate {
-			reply.Agree = false
-			return
-		}
-		// must be follower below
-	}
-	// a new term comes, setting it as follower
-	rf.state = Follower
-	// when voting, do increase term?
-	rf.term = args.Term
-	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration()) // sleep after vote
-	if rf.votedFor == -1 || rf.votedFor == args.From {
-		rf.votedFor = args.From
-		reply.Agree = true
-		fmt.Printf("Node %v - Got **VoteRequest** from %v and vote True, votedFor: %v \n", rf.me, args.From, rf.votedFor)
 	} else {
-		reply.Agree = false
-		fmt.Printf("Node %v - Got **VoteRequest** from %v and vote False, votedFor: %v \n", rf.me, args.From, rf.votedFor)
+		if args.Term > rf.term {
+			// a new term comes, setting it as follower
+			rf.state = Follower
+			rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration()) // sleep after vote
+		}
+		notYetVoted := rf.votedFor == -1
+		votedTheSameBefore := rf.votedFor == args.From
+		if notYetVoted || votedTheSameBefore {
+			rf.term = args.Term // Update term
+			rf.votedFor = args.From
+			rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration()) // sleep after vote
+			reply.Agree = true
+			reply.Term = rf.term
+			fmt.Printf("Node %v - Got **VoteRequest** from %v and vote True, votedFor: %v \n", rf.me, args.From, rf.votedFor)
+		}
 	}
-	return
 }
 
 type HeartBeatRequest struct {
@@ -229,6 +222,7 @@ type HeartBeatRequest struct {
 }
 type HeartBeatReply struct {
 	Good bool
+	Term int
 }
 
 func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
@@ -248,10 +242,12 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		rf.term = args.Term
 		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 		reply.Good = true
+		reply.Term = rf.term
 		fmt.Printf("Node %v -> [HeatsBeat] from %v - term: %v, currentTerm: %v, state: %v, --- Reply to %v\n", rf.me, args.From, args.Term, rf.term, rf.state, args.From)
 		return
 	} else {
 		reply.Good = false
+		reply.Term = rf.term
 		fmt.Printf("Node %v -> [HeatsBeat] from %v - term: %v, currentTerm: %v, state: %v, --- Ignore to %v\n", rf.me, args.From, args.Term, rf.term, rf.state, args.From)
 		return // ignore
 	}
@@ -348,29 +344,26 @@ func (rf *Raft) ticker() {
 		// t := <-rf.electionTimeoutTime.C // wait to check state...
 		rf.mu.Lock()
 		if time.Now().Before(rf.electionTimeoutTime) { // don't go elect if rf.electionTimeoutTime is after now
-			time.Sleep(time.Millisecond * 30) // sleep for a while
+			time.Sleep(time.Millisecond * 20) // sleep for a while
 			rf.mu.Unlock()
 			continue
 		}
 
 		fmt.Printf("Node %v as %v - DEBUG ticker - term: %v ;\n", rf.me, rf.state, rf.term)
 		if rf.state == Leader {
-			fmt.Printf("Leader %v sends heartsbeat to others... \n", rf.me)
+			fmt.Printf("Leader %v sends heartsbeat term %v to others... \n", rf.me, rf.term)
 
-			var wg sync.WaitGroup
 			c1 := make(chan int)
 
 			for i, other := range rf.peers {
 				peer := other // needed for solving datarace
 				if i != rf.me {
-					wg.Add(1)
 					var args *HeartBeatRequest = &HeartBeatRequest{
 						From: rf.me,
 						Term: rf.term,
 					}
 					var reply *HeartBeatReply = &HeartBeatReply{}
 					go func() {
-						defer wg.Done()
 						if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
 							if reply.Good {
 								c1 <- 1
@@ -378,22 +371,26 @@ func (rf *Raft) ticker() {
 							}
 						}
 						c1 <- 0
-						fmt.Printf("Leader %v sends heartsbeat to %v failed\n", rf.me, i)
+						fmt.Printf("Leader %v sends heartsbeat term %v to %v failed\n", args.From, args.Term, i)
 					}()
 				}
 			}
 			rf.mu.Unlock()
 
 			heartBeatCount := 1 // vote for myself
+			needToLoop := true
 			for i, _ := range rf.peers {
-				if i != rf.me {
+				if i != rf.me && needToLoop {
 					select {
 					case vote := <-c1:
 						heartBeatCount = heartBeatCount + vote
 					}
+					if heartBeatCount >= len(rf.peers)/2+1 {
+						needToLoop = false
+						continue
+					}
 				}
 			}
-			wg.Wait()
 			rf.mu.Lock()
 
 			if heartBeatCount >= len(rf.peers)/2+1 {
@@ -429,19 +426,16 @@ func (rf *Raft) ticker() {
 				continue
 			}
 
-			var wg sync.WaitGroup
 			c1 := make(chan int)
 			for i, other := range rf.peers {
 				if i != rf.me {
 					peer := other
-					wg.Add(1)
 					var args *RequestVoteArgs = &RequestVoteArgs{
 						From: rf.me,
 						Term: rf.term,
 					}
 					var reply *RequestVoteReply = &RequestVoteReply{}
 					go func() {
-						defer wg.Done()
 						//fmt.Printf("--- go func --- start \n")
 						if ok := peer.Call("Raft.RequestVote", args, reply); ok {
 							if reply.Agree {
@@ -458,19 +452,24 @@ func (rf *Raft) ticker() {
 			rf.mu.Unlock()
 
 			voteCount := 1 // vote for myself
+			needToLoop := true
 			for i, _ := range rf.peers {
-				if i != rf.me {
+				if i != rf.me && needToLoop {
 					select {
 					case vote := <-c1:
 						voteCount = voteCount + vote
 					}
+					if voteCount >= len(rf.peers)/2+1 {
+						needToLoop = false
+						continue
+					}
 				}
 			}
 
-			wg.Wait()
 			rf.mu.Lock()
 
 			if rf.state == Follower { // check whether this candidate has been set back to Follower
+				fmt.Printf("Node %v set back to Follower while trying to get vote as Candidate\n", rf.me)
 				rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 				rf.mu.Unlock()
 				continue
@@ -527,7 +526,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) getElectionTimeoutDuration() time.Duration {
-	intn := rf.rand.Intn(240)
+	intn := rf.rand.Intn(300)
 	// fmt.Printf("intn-------%v \n", intn)
 	return rf.followerTimeout + time.Millisecond*time.Duration(intn)
 }
