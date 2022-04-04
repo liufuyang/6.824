@@ -200,9 +200,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		if args.Term > rf.term {
 			// a new term comes, setting it as follower
-			rf.state = Follower
-			rf.votedFor = -1                                                         // IMPORTANT - need to clean votedFor when step down
-			rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration()) // sleep after vote
+			rf.stepDownAsFollower(args.Term)
 		}
 		notYetVoted := rf.votedFor == -1
 		votedTheSameBefore := rf.votedFor == args.From
@@ -238,10 +236,8 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	// state. If the term in the RPC is smaller than the candidate’s
 	// current term, then the candidate rejects the RPC and continues in candidate state.
 	if args.Term >= rf.term {
-		rf.state = Follower
 		rf.votedFor = args.From
-		rf.term = args.Term
-		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		rf.stepDownAsFollower(args.Term)
 
 		reply.Good = true
 		reply.Term = rf.term
@@ -377,10 +373,10 @@ func (rf *Raft) tickerAsLeader() {
 	fmt.Printf("Leader %v sends heartsbeat term %v to others... \n", rf.me, rf.term)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	c1 := make(chan int)
+	c1 := make(chan *HeartBeatReply)
 
 	for i, other := range rf.peers {
-		peer := other // needed for solving datarace
+		peer := other // needed for solving data race
 		if i != rf.me {
 			var args *HeartBeatRequest = &HeartBeatRequest{
 				From: rf.me,
@@ -390,23 +386,30 @@ func (rf *Raft) tickerAsLeader() {
 			go func() {
 				if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
 					if reply.Good {
-						c1 <- 1
+						c1 <- reply
 						return
 					}
 				}
-				c1 <- 0
+				c1 <- reply
 				fmt.Printf("Leader %v sends heartsbeat term %v to %v failed\n", args.From, args.Term, i)
 			}()
 		}
 	}
+	currentTerm := rf.term
 	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
 	heartBeatCount := 1 // vote for myself
 	needToLoop := true
 	for i, _ := range rf.peers {
 		if i != rf.me && needToLoop {
 			select {
-			case vote := <-c1:
-				heartBeatCount = heartBeatCount + vote
+			case reply := <-c1:
+				if reply.Term > currentTerm {
+					rf.stepDownAsFollower(reply.Term)
+					return
+				}
+				if reply.Good {
+					heartBeatCount = heartBeatCount + 1
+				}
 			}
 			if heartBeatCount >= len(rf.peers)/2+1 {
 				needToLoop = false
@@ -443,7 +446,7 @@ func (rf *Raft) tickerAsCandidate() {
 		return
 	}
 
-	c1 := make(chan int)
+	c1 := make(chan *RequestVoteReply)
 	for i, other := range rf.peers {
 		if i != rf.me {
 			peer := other
@@ -456,24 +459,31 @@ func (rf *Raft) tickerAsCandidate() {
 				//fmt.Printf("--- go func --- start \n")
 				if ok := peer.Call("Raft.RequestVote", args, reply); ok {
 					if reply.Agree {
-						c1 <- 1
+						c1 <- reply
 						//fmt.Printf("--- go func --- end \n")
 						return
 					}
 				}
-				c1 <- 0
+				c1 <- reply
 				// fmt.Printf("--- go func --- end \n")
 			}()
 		}
 	}
+	currentTerm := rf.term
 	rf.mu.Unlock()
 	voteCount := 1 // vote for myself
 	needToLoop := true
 	for i, _ := range rf.peers {
 		if i != rf.me && needToLoop {
 			select {
-			case vote := <-c1:
-				voteCount = voteCount + vote
+			case reply := <-c1:
+				if reply.Term > currentTerm {
+					rf.stepDownAsFollower(reply.Term)
+					return
+				}
+				if reply.Agree {
+					voteCount = voteCount + 1
+				}
 			}
 			if voteCount >= len(rf.peers)/2+1 {
 				needToLoop = false // IMPORTANT - do not wait for other remote calls if we already connected enough votes. Otherwise, it makes tests timeout
@@ -499,6 +509,13 @@ func (rf *Raft) tickerAsCandidate() {
 	}
 }
 
+func (rf *Raft) stepDownAsFollower(term int) {
+	rf.state = Follower
+	rf.term = term
+	rf.votedFor = -1 // IMPORTANT - need to clean votedFor when step down
+	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+}
+
 //
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
@@ -521,12 +538,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (2A, 2B, 2C).
 	rf.followerTimeout = time.Millisecond * 150 // Follower Time Out
-	rf.state = Follower
-	rf.votedFor = -1
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
-	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration
-	rf.term = 0
+	rf.stepDownAsFollower(0)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
