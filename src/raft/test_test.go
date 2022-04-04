@@ -7,6 +7,8 @@ package raft
 // so, while you can modify this code to help you debug, please
 // test with the original before submitting.
 //
+// go test -race -run 2A
+//
 
 import "testing"
 import "fmt"
@@ -60,24 +62,29 @@ func TestReElection2A(t *testing.T) {
 	leader1 := cfg.checkOneLeader()
 
 	// if the leader disconnects, a new one should be elected.
+	fmt.Printf("test --- disconnect leader: %v \n", leader1)
 	cfg.disconnect(leader1)
 	cfg.checkOneLeader()
+	fmt.Printf("test --- check one leader a \n")
 
 	// if the old leader rejoins, that shouldn't
 	// disturb the new leader. and the old leader
 	// should switch to follower.
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
+	fmt.Printf("test --- leader: %v \n", leader2)
 
 	// if there's no quorum, no new leader should
 	// be elected.
 	cfg.disconnect(leader2)
 	cfg.disconnect((leader2 + 1) % servers)
+	fmt.Printf("test --- disconnect the other 2: %v \n", leader2)
 	time.Sleep(2 * RaftElectionTimeout)
 
 	// check that the one connected server
 	// does not think it is the leader.
 	cfg.checkNoLeader()
+	fmt.Printf("test --- checkNoLeader \n")
 
 	// if a quorum arises, it should elect a leader.
 	cfg.connect((leader2 + 1) % servers)
@@ -105,6 +112,7 @@ func TestManyElections2A(t *testing.T) {
 		i1 := rand.Int() % servers
 		i2 := rand.Int() % servers
 		i3 := rand.Int() % servers
+		fmt.Printf("ttttttt test - disconnect %v %v %v \n", i1, i2, i3)
 		cfg.disconnect(i1)
 		cfg.disconnect(i2)
 		cfg.disconnect(i3)

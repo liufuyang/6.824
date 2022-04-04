@@ -18,14 +18,16 @@ package raft
 //
 
 import (
+	"fmt"
+	"math/rand"
 	//	"bytes"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -64,16 +66,45 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// for leader election
+	term                  int
+	state                 ServerState
+	followerTimeout       time.Duration
+	rand                  *rand.Rand
+	electionTimeoutTime   time.Time
+	heartsBeatDuration    time.Duration
+	candidateStartingTime time.Time
+	votedFor              int
+}
+
+type ServerState int
+
+const (
+	Leader ServerState = iota
+	Follower
+	Candidate
+)
+
+func (s ServerState) String() string {
+	switch s {
+	case Leader:
+		return "Leader"
+	case Follower:
+		return "Follower"
+	case Candidate:
+		return "Candidate"
+	default:
+		return fmt.Sprintf("%d", int(s))
+	}
 }
 
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	// Your code here (2A).
-	return term, isleader
+	return rf.term, rf.state == Leader
 }
 
 //
@@ -91,7 +122,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +145,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -136,13 +165,14 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	From int
+	Term int
 }
 
 //
@@ -151,6 +181,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Agree bool
+	Term  int
 }
 
 //
@@ -158,6 +190,73 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	fmt.Printf("Node %v - Got **VoteRequest** from %v - term: %v, currentTerm: %v, votedFor: %v state: %v\n", rf.me, args.From, args.Term, rf.term, rf.votedFor, rf.state)
+	if args.Term < rf.term {
+		reply.Agree = false
+		reply.Term = rf.term
+		return
+	} else {
+		if args.Term > rf.term {
+			// a new term comes, setting it as follower
+			rf.stepDownAsFollower(args.Term)
+		}
+		// added a safer check - so to avoid situations like 3 candidate doing triangle voting making 3 leaders?
+		if args.Term == rf.term && rf.state != Follower {
+			reply.Agree = false
+			reply.Term = rf.term
+			return
+		}
+		// must be a follower here
+		if rf.state != Follower {
+			panic("rf must be a Follower in this stage of RequestVote, but it is not.")
+		}
+		notYetVoted := rf.votedFor == -1
+		votedTheSameBefore := rf.votedFor == args.From
+		if notYetVoted || votedTheSameBefore {
+			rf.stepDownAsFollower(args.Term) // reset election timeout so if a follower is not
+			rf.votedFor = args.From          // make sure this is set again after the step above
+			reply.Agree = true
+			reply.Term = rf.term
+			fmt.Printf("Node %v - Got **VoteRequest** from %v and vote True, votedFor: %v \n", rf.me, args.From, rf.votedFor)
+		}
+	}
+}
+
+type HeartBeatRequest struct {
+	From int
+	Term int
+}
+type HeartBeatReply struct {
+	Good bool
+	Term int
+}
+
+// HeartBeat : While waiting for votes, a candidate may receive an
+// AppendEntries RPC from another server claiming to be
+// leader. If the leader’s term (included in its RPC) is at least
+// as large as the candidate’s current term, then the candidate
+// recognizes the leader as legitimate and returns to follower
+// state. If the term in the RPC is smaller than the candidate’s
+// current term, then the candidate rejects the RPC and continues in candidate state.
+func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term >= rf.term {
+		rf.stepDownAsFollower(args.Term) // reset election timeout elapses when receiving AppendEntries RPC from current leader (or a new leader with higher term)
+		rf.votedFor = args.From          // make sure this is set again after the step above
+		reply.Good = true
+		reply.Term = rf.term
+		fmt.Printf("Node %v -> [HeatsBeat] from %v - term: %v, currentTerm: %v, state: %v, --- Reply to %v\n", rf.me, args.From, args.Term, rf.term, rf.state, args.From)
+		return
+	} else {
+		// allow election timeout later when receiving AppendEntries RPC from low term calls
+		reply.Good = false
+		reply.Term = rf.term
+		fmt.Printf("Node %v -> [HeatsBeat] from %v - term: %v, currentTerm: %v, state: %v, --- Ignore to %v\n", rf.me, args.From, args.Term, rf.term, rf.state, args.From)
+		return // ignore
+	}
 }
 
 //
@@ -194,7 +293,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
-
 //
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -215,7 +313,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -244,13 +341,183 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	for rf.killed() == false {
 
+	for rf.killed() == false {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
+		rf.mu.Lock()
+		if time.Now().Before(rf.electionTimeoutTime) { // don't go elect if rf.electionTimeoutTime is after now
+			time.Sleep(time.Millisecond * 20) // sleep for a while
+			rf.mu.Unlock()
+			continue
+		}
+
+		fmt.Printf("Node %v as %v - DEBUG ticker - term: %v ;\n", rf.me, rf.state, rf.term)
+		if rf.state == Leader {
+			rf.mu.Unlock()
+			rf.tickerAsLeader()
+			continue
+		} else if rf.state == Follower {
+			rf.term = rf.term + 1 // --------- only place that bumps term ------------
+			rf.state = Candidate
+			rf.votedFor = -1
+			rf.candidateStartingTime = time.Now()
+			fmt.Printf("----- %v step up as candidate -----\n", rf.me)
+			rf.mu.Unlock()
+			continue
+		} else if rf.state == Candidate {
+			rf.mu.Unlock()
+			rf.tickerAsCandidate()
+			continue
+		}
 
 	}
+}
+
+func (rf *Raft) tickerAsLeader() {
+	fmt.Printf("Leader %v sends heartsbeat term %v to others... \n", rf.me, rf.term)
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	c1 := make(chan *HeartBeatReply)
+
+	for i, other := range rf.peers {
+		peer := other // needed for solving data race
+		if i != rf.me {
+			var args *HeartBeatRequest = &HeartBeatRequest{
+				From: rf.me,
+				Term: rf.term,
+			}
+			var reply *HeartBeatReply = &HeartBeatReply{}
+			go func() {
+				if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
+					if reply.Good {
+						c1 <- reply
+						return
+					}
+				}
+				c1 <- reply
+				fmt.Printf("Leader %v sends heartsbeat term %v to %v failed\n", args.From, args.Term, i)
+			}()
+		}
+	}
+	currentTerm := rf.term
+	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
+	heartBeatCount := 1 // vote for myself
+	needToLoop := true
+	for i, _ := range rf.peers {
+		if i != rf.me && needToLoop {
+			select {
+			case reply := <-c1:
+				if reply.Term > currentTerm {
+					rf.stepDownAsFollower(reply.Term)
+					rf.mu.Lock()
+					return
+				}
+				if reply.Good {
+					heartBeatCount = heartBeatCount + 1
+				}
+			}
+			if heartBeatCount >= len(rf.peers)/2+1 {
+				needToLoop = false
+				continue
+			}
+		}
+	}
+	rf.mu.Lock()
+
+	if heartBeatCount >= len(rf.peers)/2+1 {
+		fmt.Printf("Leader %v got heartbeat count: %v - keep being leader\n", rf.me, heartBeatCount)
+		rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
+	} else {
+		// leader doesn't get enough heartbeats from most of the candidate, step down
+		fmt.Printf("Leader %v got heartbeat count: %v - setting back to follower\n", rf.me, heartBeatCount)
+		rf.stepDownAsFollower(rf.term)
+	}
+}
+func (rf *Raft) tickerAsCandidate() {
+	//  A candidate continues in this state until one of three things happens:
+	//  (a) it wins the election,
+	//  (b) another server establishes itself as leader, or
+	//  (c) a period of time goes by with no winner
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if time.Now().After(rf.candidateStartingTime.Add(rf.getElectionTimeoutDuration())) {
+		fmt.Printf("----- %v step dowm from candidate to follower as timeout -----\n", rf.me)
+		rf.stepDownAsFollower(rf.term)
+		return
+	}
+
+	c1 := make(chan *RequestVoteReply)
+	for i, other := range rf.peers {
+		if i != rf.me {
+			peer := other
+			var args *RequestVoteArgs = &RequestVoteArgs{
+				From: rf.me,
+				Term: rf.term,
+			}
+			var reply *RequestVoteReply = &RequestVoteReply{}
+			go func() {
+				//fmt.Printf("--- go func --- start \n")
+				if ok := peer.Call("Raft.RequestVote", args, reply); ok {
+					if reply.Agree {
+						c1 <- reply
+						//fmt.Printf("--- go func --- end \n")
+						return
+					}
+				}
+				c1 <- reply
+				// fmt.Printf("--- go func --- end \n")
+			}()
+		}
+	}
+	currentTerm := rf.term
+	rf.mu.Unlock()
+	voteCount := 1 // vote for myself
+	needToLoop := true
+	for i, _ := range rf.peers {
+		if i != rf.me && needToLoop {
+			select {
+			case reply := <-c1:
+				if reply.Term > currentTerm {
+					rf.stepDownAsFollower(reply.Term)
+					rf.mu.Lock()
+					return
+				}
+				if reply.Agree {
+					voteCount = voteCount + 1
+				}
+			}
+			if voteCount >= len(rf.peers)/2+1 {
+				needToLoop = false // IMPORTANT - do not wait for other remote calls if we already connected enough votes. Otherwise, it makes tests timeout
+				continue
+			}
+		}
+	}
+	rf.mu.Lock()
+
+	// check whether this candidate has been set back to Follower
+	if rf.state == Follower {
+		fmt.Printf("Node %v set back to Follower while trying to get vote as Candidate\n", rf.me)
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		return
+	}
+
+	fmt.Printf("Node %v got vote count %v\n", rf.me, voteCount)
+	if voteCount >= len(rf.peers)/2+1 {
+		fmt.Printf("------L------ Setting %v as Leader\n", rf.me)
+		rf.state = Leader
+	} else {
+		rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
+	}
+}
+
+func (rf *Raft) stepDownAsFollower(term int) {
+	rf.state = Follower
+	rf.term = term
+	rf.votedFor = -1 // IMPORTANT - need to clean votedFor when step down
+	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 }
 
 //
@@ -267,11 +534,17 @@ func (rf *Raft) ticker() {
 func Make(peers []*labrpc.ClientEnd, me int,
 	persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
+	rf.followerTimeout = time.Millisecond * 100 // Follower Time Out
+	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
+	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration
+	rf.stepDownAsFollower(0)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -279,6 +552,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
-
 	return rf
+}
+
+// getElectionTimeoutDuration returns a duration between [rf.followerTimeout, rf.followerTimeout + 200)
+func (rf *Raft) getElectionTimeoutDuration() time.Duration {
+	intn := rf.rand.Intn(200)
+	return rf.followerTimeout + time.Millisecond*time.Duration(intn)
 }
