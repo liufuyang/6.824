@@ -335,11 +335,9 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 
 	for rf.killed() == false {
-
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		// t := <-rf.electionTimeoutTime.C // wait to check state...
 		rf.mu.Lock()
 		if time.Now().Before(rf.electionTimeoutTime) { // don't go elect if rf.electionTimeoutTime is after now
 			time.Sleep(time.Millisecond * 20) // sleep for a while
@@ -405,6 +403,7 @@ func (rf *Raft) tickerAsLeader() {
 			case reply := <-c1:
 				if reply.Term > currentTerm {
 					rf.stepDownAsFollower(reply.Term)
+					rf.mu.Lock()
 					return
 				}
 				if reply.Good {
@@ -425,9 +424,7 @@ func (rf *Raft) tickerAsLeader() {
 	} else {
 		// leader doesn't get enough heartbeats from most of the candidate, step down
 		fmt.Printf("Leader %v got heartbeat count: %v - setting back to follower\n", rf.me, heartBeatCount)
-		rf.state = Follower
-		rf.votedFor = -1
-		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		rf.stepDownAsFollower(rf.term)
 	}
 }
 func (rf *Raft) tickerAsCandidate() {
@@ -440,9 +437,7 @@ func (rf *Raft) tickerAsCandidate() {
 	defer rf.mu.Unlock()
 	if time.Now().After(rf.candidateStartingTime.Add(rf.getElectionTimeoutDuration())) {
 		fmt.Printf("----- %v step dowm from candidate to follower as timeout -----\n", rf.me)
-		rf.state = Follower
-		rf.votedFor = -1
-		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		rf.stepDownAsFollower(rf.term)
 		return
 	}
 
@@ -479,6 +474,7 @@ func (rf *Raft) tickerAsCandidate() {
 			case reply := <-c1:
 				if reply.Term > currentTerm {
 					rf.stepDownAsFollower(reply.Term)
+					rf.mu.Lock()
 					return
 				}
 				if reply.Agree {
@@ -505,7 +501,7 @@ func (rf *Raft) tickerAsCandidate() {
 		fmt.Printf("------L------ Setting %v as Leader\n", rf.me)
 		rf.state = Leader
 	} else {
-		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
 	}
 }
 
