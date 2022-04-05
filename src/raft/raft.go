@@ -17,6 +17,9 @@ package raft
 //   in the same server.
 //
 
+// TODO
+// TODO: Picking Best Leader
+
 import (
 	"fmt"
 	"math/rand"
@@ -106,9 +109,9 @@ const (
 func (s ServerState) String() string {
 	switch s {
 	case Leader:
-		return "Leader"
+		return "*Leader* "
 	case Follower:
-		return "Follower"
+		return "Follower "
 	case Candidate:
 		return "Candidate"
 	default:
@@ -270,6 +273,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	if args.Term >= rf.term {
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
 		// whose Term matches prevLogTerm (§5.3)
+		// First entry case is also covered as rf.lastLogIndex()=0=args.PrevLogIndex and terms are the same as 0
 		if rf.lastLogIndex() < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Good = false
 			reply.Term = rf.term
@@ -283,7 +287,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			//  but different terms), delete the existing entry and all that follow it (§5.3)
 			// leader:       [x, 1, 2, 3, 4] --- args.PrevLogIndex->3
 			// follower now: [x, 1, 2, 3]    --- rf.lastLogIndex()->3
-			// here we know rf.lastLogIndex() >= args.PrevLogIndex
+			// here we know rf.lastLogIndex() >= args.PrevLogIndex and rf.log[args.PrevLogIndex].Term == args.PrevLogTerm
 			for i, v := range rf.log[args.PrevLogIndex+1 : rf.lastLogIndex()+1] {
 				if i < len(args.Entries) && v.Term != args.Entries[i].Term {
 					rf.log = rf.log[:args.PrevLogTerm+1+i]
@@ -300,10 +304,22 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			for _, v := range args.Entries[diff:] {
 				rf.log = append(rf.log, v)
 			}
-
-			// [PAPER] AppendEntries-RPC - Receiver implementation: 5.  If LeaderCommit > commitIndex, set commitIndex = min(LeaderCommit, index of last new entry)
-			if args.LeaderCommit > rf.commitIndex {
-				rf.commitIndex = min(args.LeaderCommit, rf.lastLogIndex())
+		}
+		// [PAPER] AppendEntries-RPC - Receiver implementation: 5.  If LeaderCommit > commitIndex, set commitIndex = min(LeaderCommit, index of last new entry)
+		// Follower commit
+		if args.LeaderCommit > rf.commitIndex {
+			newCommitIndex := min(args.LeaderCommit, rf.lastLogIndex())
+			if rf.commitIndex != newCommitIndex {
+				startIndex := rf.commitIndex + 1 // start from the new entry after previous committed value
+				rf.commitIndex = newCommitIndex
+				for i, v := range rf.log[startIndex : newCommitIndex+1] {
+					rf.applyCh <- ApplyMsg{
+						CommandValid: true,
+						Command:      v.Command,
+						CommandIndex: startIndex + i,
+					}
+					rf.DPrintf(TopicTickerLeader, "Follower committed new log with index %v\n", rf.commitIndex+i)
+				}
 			}
 		}
 
@@ -389,12 +405,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return rf.lastLogIndex(), rf.term, true
 }
 
-// lastLogIndex returns 0 meaning empty log, otherwise return the last entry index
+// lastLogIndex returns 0 meaning empty log (include an initial dummy entry), otherwise return the last entry index
 func (rf *Raft) lastLogIndex() int {
 	return len(rf.log) - 1
 }
 
-// lastLogTerm returns 0 meaning empty log, otherwise return the last entry index
+// lastLogTerm returns 0 meaning empty log (include an initial dummy entry), otherwise return the last entry index
 func (rf *Raft) lastLogTerm() int {
 	index := len(rf.log) - 1
 	if index == 0 {
@@ -490,11 +506,11 @@ func (rf *Raft) tickerAsLeader() {
 				args.Entries = rf.log[rf.nextIndexes[i] : rf.lastLogIndex()+1]
 				args.PrevLogIndex = rf.nextIndexes[i] - 1
 				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-				args.LeaderCommit = rf.lastLogIndex()
 
 				nextIndexes[i] = rf.lastLogIndex() + 1
 				matchIndexes[i] = rf.lastLogIndex() // TODO - is this what to specific for matchIndexes?
 			}
+			args.LeaderCommit = rf.commitIndex
 
 			go func() {
 				if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
@@ -539,21 +555,26 @@ func (rf *Raft) tickerAsLeader() {
 
 		// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
 		// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
-		N := rf.commitIndex + 1 // TODO - make it more efficient, jump more with N
-		numberOfMatchIndexLEtoN := 1
-		for i, _ := range rf.peers {
-			if i != rf.me && rf.matchIndexes[i] >= N {
-				numberOfMatchIndexLEtoN = numberOfMatchIndexLEtoN + 1
+		N := rf.commitIndex + 1
+		for ; ; N += 1 { // make it more efficient, jump more with N
+			numberOfMatchIndexLEtoN := 1
+			for i, _ := range rf.peers {
+				if i != rf.me && rf.matchIndexes[i] >= N {
+					numberOfMatchIndexLEtoN = numberOfMatchIndexLEtoN + 1
+				}
 			}
-		}
 
-		if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 && rf.log[N].Term == currentTerm {
-			fmt.Println("111111111111111111111111111111111111111111111111111111111111111")
-			rf.commitIndex = N
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      rf.log[N].Command,
-				CommandIndex: N,
+			if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 && rf.log[N].Term == currentTerm {
+				// Leader commit
+				rf.commitIndex = N
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[N].Command,
+					CommandIndex: N,
+				}
+				rf.DPrintf(TopicTickerLeader, "Leader committed new log\n")
+			} else {
+				break
 			}
 		}
 
@@ -589,16 +610,13 @@ func (rf *Raft) tickerAsCandidate() {
 			}
 			var reply *RequestVoteReply = &RequestVoteReply{}
 			go func() {
-				//fmt.Printf("--- go func --- start \n")
 				if ok := peer.Call("Raft.RequestVote", args, reply); ok {
 					if reply.Agree {
 						c1 <- reply
-						//fmt.Printf("--- go func --- end \n")
 						return
 					}
 				}
 				c1 <- reply
-				// fmt.Printf("--- go func --- end \n")
 			}()
 		}
 	}
