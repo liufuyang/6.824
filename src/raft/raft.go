@@ -316,7 +316,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
 		// whose Term matches prevLogTerm (§5.3)
 		// First entry case is also covered as rf.lastLogIndex()=0=args.PrevLogIndex and terms are the same as 0
-		rf.DPrintf(TopicHB, "--------HeartBeat------ rf.lastLogIndex(): %v, args.PrevLogIndex: %v", rf.lastLogIndex(), args.PrevLogIndex)
+		rf.DPrintf(TopicHB, "--------HeartBeat------ args.PrevLogIndex: %v, args.Entries:%v", args.PrevLogIndex, args.Entries)
 		if rf.lastLogIndex() < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Good = false
 			reply.Term = rf.term
@@ -679,9 +679,8 @@ func (rf *Raft) tickerAsCandidate() {
 	currentTerm := rf.term
 	rf.mu.Unlock()
 	voteCount := 1 // vote for myself
-	needToLoop := true
 	for p, _ := range rf.peers {
-		if p != rf.me && needToLoop {
+		if p != rf.me {
 			select {
 			case reply := <-c1:
 				if reply.Term > currentTerm {
@@ -692,10 +691,8 @@ func (rf *Raft) tickerAsCandidate() {
 				if reply.Agree {
 					voteCount = voteCount + 1
 				}
-			}
-			if voteCount >= len(rf.peers)/2+1 {
-				needToLoop = false // IMPORTANT - do not wait for other remote calls if we already connected enough votes. Otherwise, it makes tests timeout
-				continue
+			case <-time.After(rf.followerTimeout / 3):
+				rf.DPrintf(TopicTickerLeader, "Candidate call for vote to a peer timeout, giving up calling\n")
 			}
 		}
 	}
