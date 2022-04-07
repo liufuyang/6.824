@@ -502,7 +502,7 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		rf.mu.Lock()
 		if time.Now().Before(rf.electionTimeoutTime) { // don't go elect if rf.electionTimeoutTime is after now
-			time.Sleep(time.Millisecond * 10) // sleep for a while
+			time.Sleep(time.Millisecond * 5) // sleep for a while
 			rf.mu.Unlock()
 			continue
 		}
@@ -608,7 +608,7 @@ func (rf *Raft) tickerAsLeader() {
 					rf.nextIndexes[i] = max(1, rf.nextIndexes[i]-1)
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
-			case <-time.After(rf.heartsBeatDuration / 3):
+			case <-time.After(time.Millisecond * 30):
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
 			}
 		}
@@ -710,7 +710,7 @@ func (rf *Raft) tickerAsCandidate() {
 				if reply.Agree {
 					voteCount = voteCount + 1
 				}
-			case <-time.After(rf.followerTimeout / 3):
+			case <-time.After(time.Millisecond * 30):
 				rf.DPrintf(TopicTickerLeader, "Candidate call for vote to a peer timeout, giving up calling\n")
 			}
 		}
@@ -789,7 +789,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // getElectionTimeoutDuration returns a duration between [rf.followerTimeout, rf.followerTimeout + 200)
 func (rf *Raft) getElectionTimeoutDuration() time.Duration {
-	intn := rf.rand.Intn(250)
+	intn := rf.rand.Intn(150)
 	return rf.followerTimeout + time.Millisecond*time.Duration(intn)
 }
 
