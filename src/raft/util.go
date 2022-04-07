@@ -62,9 +62,9 @@ func init() {
 }
 
 func TPrintf(topic logTopic, traceStr string, format string, a ...interface{}) {
-	if topic == TopicVR { // change this to filter other logs
-		return
-	}
+	//if topic == TopicVR { // change this to filter other logs
+	//	return
+	//}
 	if debugVerbosity == none {
 		return
 	}

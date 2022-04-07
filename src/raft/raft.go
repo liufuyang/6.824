@@ -1,5 +1,10 @@
 package raft
 
+// Raft:
+// Committed -> Present in the future leader's logs
+//   - Restrictions on commit
+//   - Restrictions on leader election
+
 //
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
@@ -16,9 +21,6 @@ package raft
 //   should send an ApplyMsg to the service (or tester)
 //   in the same server.
 //
-
-// TODO
-// TODO: Picking Best Leader
 
 import (
 	"fmt"
@@ -194,8 +196,8 @@ type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
 	From         int
 	Term         int
-	LastLogIndex int // index of candidate’s last log entry (§5.4)
-	LastLogTerm  int // Term of candidate’s last log entry (§5.4)
+	LastLogIndex int // index of candidate’s last log entry (§5.4) - for leader election restrictions
+	LastLogTerm  int // Term of candidate’s last log entry (§5.4) - for leader election restrictions
 }
 
 //
@@ -235,6 +237,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if rf.state != Follower {
 			panic("rf must be a Follower in this stage of RequestVote, but it is not.")
 		}
+
+		// leader restrictions [PAPER] RequestVote PRC - Receiver Impl 2.
+		if (rf.lastLogTerm() > args.LastLogTerm) ||
+			(rf.lastLogTerm() == args.LastLogTerm && rf.lastLogIndex() > args.LastLogIndex) {
+			reply.Agree = false
+			reply.Term = rf.term
+			rf.DPrintf(TopicVR, "Leader restriction check did not pass, vote false for %v", args.From)
+			return
+		}
+
 		notYetVoted := rf.votedFor == -1
 		votedTheSameBefore := rf.votedFor == args.From
 		if notYetVoted || votedTheSameBefore {

@@ -293,7 +293,9 @@ func TestFailAgree2B(t *testing.T) {
 
 	// disconnect one follower from the network.
 	leader := cfg.checkOneLeader()
-	cfg.disconnect((leader + 1) % servers)
+	nodeF := (leader + 1) % servers
+	fmt.Printf("---tset---: disconnecting %v\n", nodeF)
+	cfg.disconnect(nodeF)
 
 	// the leader and remaining follower should be
 	// able to agree despite the disconnected follower.
@@ -304,7 +306,8 @@ func TestFailAgree2B(t *testing.T) {
 	cfg.one(105, servers-1, false)
 
 	// re-connect
-	cfg.connect((leader + 1) % servers)
+	fmt.Printf("---tset---: reconnect %v\n", nodeF)
+	cfg.connect(nodeF)
 
 	// the full set of servers should preserve
 	// previous agreements, and be able to agree
