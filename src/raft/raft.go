@@ -267,9 +267,10 @@ type HeartBeatRequest struct {
 	LeaderCommit int     // leader’s commitIndex
 }
 type HeartBeatReply struct {
-	Good bool // true if follower contained entry matching prevLogIndex and prevLogTerm - TODO
-	Term int
-	From int
+	Good         bool // true if follower contained entry matching prevLogIndex and prevLogTerm - TODO
+	Term         int
+	From         int
+	LastLogIndex int
 }
 
 // HeartBeat : While waiting for votes, a candidate may receive an
@@ -326,6 +327,13 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		if rf.lastLogIndex() < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Good = false
 			reply.Term = rf.term
+
+			if rf.lastLogIndex() >= args.PrevLogIndex {
+				// here means PrevLogTerm miss match
+				rf.log = rf.log[:args.PrevLogIndex]
+			}
+			reply.LastLogIndex = rf.lastLogIndex() // speed up
+
 			rf.DPrintf(TopicHB, "false return as prevLogIndex/Term missmatch - args.From:%v, args.Term:%v, rf.lastLogIndex(): %v, prevLogIndex: %v\n",
 				args.From, args.Term, rf.lastLogIndex(), args.PrevLogIndex)
 			rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
@@ -349,7 +357,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			// follower now: [x, 1, 2, 3 ] --- rf.lastLogIndex()->3, diff->1
 			diff := rf.lastLogIndex() - args.PrevLogIndex
 			if diff > 0 {
-				fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa append log len:%v\n", len(args.Entries[diff:]))
+				fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa entries has some duplicates append, diff:%v log len:%v\n", diff, len(args.Entries[diff:]))
 			}
 			rf.log = append(rf.log, args.Entries[diff:]...)
 			//for _, v := range args.Entries[diff:] {
@@ -562,9 +570,6 @@ func (rf *Raft) tickerAsLeader() {
 			rf.DPrintf(TopicTickerLeader, "Leader state before sending ------------ rf.lastLogIndex():%v rf.nextIndexes[%v]:%v \n", rf.lastLogIndex(), i, rf.nextIndexes[i])
 			if rf.lastLogIndex() >= rf.nextIndexes[i] {
 				args.Entries = rf.log[rf.nextIndexes[i] : rf.lastLogIndex()+1]
-				//args.PrevLogIndex = rf.nextIndexes[i] - 1
-				//args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-
 				nextIndexesToBe[i] = rf.lastLogIndex() + 1
 				matchIndexesToBe[i] = rf.lastLogIndex() // TODO - is this what to specific for matchIndexesToBe?
 			}
@@ -604,8 +609,8 @@ func (rf *Raft) tickerAsLeader() {
 					heartBeatCount = heartBeatCount + 1
 					rf.DPrintf(TopicTickerLeader, "Good -------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
 				} else {
-					rf.DPrintf(TopicTickerLeader, "Bad --------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
-					rf.nextIndexes[i] = max(1, rf.nextIndexes[i]-1)
+					rf.DPrintf(TopicTickerLeader, "Bad --------------------------------------rf.nextIndexes[%v]=%v, reply.LastLogIndex=%v\n", i, rf.nextIndexes[i], reply.LastLogIndex)
+					rf.nextIndexes[i] = max(1, min(reply.LastLogIndex+1, rf.nextIndexes[i]-1)) // speed up
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 			case <-time.After(time.Millisecond * 30):
