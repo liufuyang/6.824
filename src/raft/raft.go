@@ -230,16 +230,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.term
 		return
 	} else {
-		if args.Term > rf.term {
-			// a new Term comes, setting it as follower
-			rf.stepDownAsFollower(args.Term)
-		}
 		// must be a follower here
 		if rf.state != Follower {
 			panic("rf must be a Follower in this stage of RequestVote, but it is not.")
 		}
 
-		// leader restrictions [PAPER] RequestVote PRC - Receiver Impl 2.
+		// leader restrictions [PAPER] RequestVote PRC - Receiver Impl 2. candidate’s log has to be
+		// least as up-to-date as receiver’s log before grant vote (§5.2, §5.4)
 		if (rf.lastLogTerm() > args.LastLogTerm) ||
 			(rf.lastLogTerm() == args.LastLogTerm && rf.lastLogIndex() > args.LastLogIndex) {
 			reply.Agree = false
@@ -248,11 +245,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			return
 		}
 
+		// [PAPER] RequestVote PRC - Receiver Impl 2. If votedFor is null or candidateId, grant vote
 		notYetVoted := rf.votedFor == -1
 		votedTheSameBefore := rf.votedFor == args.From
 		if notYetVoted || votedTheSameBefore {
 			rf.stepDownAsFollower(args.Term) // reset election timeout so if a follower is not
 			rf.votedFor = args.From          // make sure this is set again after the step above
+			rf.term = args.Term
 			reply.Agree = true
 			reply.Term = rf.term
 			rf.DPrintf(TopicVR, "Vote True for %v", args.From)
@@ -363,7 +362,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 						Command:      v.Command,
 						CommandIndex: startIndex + i,
 					}
-					rf.DPrintf(TopicTickerLeader, "Follower committed new log with index %v\n", rf.commitIndex+i)
+					rf.DPrintf(TopicTickerLeader, "Follower committed new log with index %v\n", startIndex+i)
 				}
 			}
 		}
@@ -537,8 +536,10 @@ func (rf *Raft) tickerAsLeader() {
 		peer := other // needed for solving data race
 		if i != rf.me {
 			var args *HeartBeatRequest = &HeartBeatRequest{
-				From: rf.me,
-				Term: rf.term,
+				From:         rf.me,
+				Term:         rf.term,
+				PrevLogIndex: rf.nextIndexes[i] - 1,
+				PrevLogTerm:  rf.log[rf.nextIndexes[i]-1].Term,
 			}
 			var reply *HeartBeatReply = &HeartBeatReply{}
 
@@ -551,11 +552,11 @@ func (rf *Raft) tickerAsLeader() {
 			//   0,  1,  2,  3  ---- rf.lastLogIndex()->3
 			//                  ---- rf.nextIndexesTo[i]->3 (only has 2 element, but by default nextIndex=lastLogIndex+1)
 			//                  ---- so args.Entries = rf.log[3, 3+1]
-			rf.DPrintf(TopicTickerLeader, "------------ rf.lastLogIndex():%v rf.nextIndexes[%v]:%v \n", rf.lastLogIndex(), i, rf.nextIndexes[i])
+			rf.DPrintf(TopicTickerLeader, "Leader state before sending ------------ rf.lastLogIndex():%v rf.nextIndexes[%v]:%v \n", rf.lastLogIndex(), i, rf.nextIndexes[i])
 			if rf.lastLogIndex() >= rf.nextIndexes[i] {
 				args.Entries = rf.log[rf.nextIndexes[i] : rf.lastLogIndex()+1]
-				args.PrevLogIndex = rf.nextIndexes[i] - 1
-				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+				//args.PrevLogIndex = rf.nextIndexes[i] - 1
+				//args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 
 				nextIndexesToBe[i] = rf.lastLogIndex() + 1
 				matchIndexesToBe[i] = rf.lastLogIndex() // TODO - is this what to specific for matchIndexesToBe?
@@ -571,7 +572,7 @@ func (rf *Raft) tickerAsLeader() {
 				}
 				c1 <- reply
 				rf.mu.Lock()
-				rf.DPrintf(TopicTickerLeader, "Leader %v sends heartbeat Term %v to %v failed\n", args.From, args.Term, i)
+				rf.DPrintf(TopicTickerLeader, "Leader<%v> sends heartbeat Term %v to Node<%v> failed\n", args.From, args.Term, i)
 				rf.mu.Unlock()
 			}()
 		}
