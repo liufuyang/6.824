@@ -757,7 +757,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out
+	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration
 	rf.applyCh = applyCh
