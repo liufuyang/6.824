@@ -28,6 +28,7 @@ const (
 	TopicTickerCandidate logTopic = "TKCandidate"
 	TopicTickerFollower  logTopic = "TKFollower "
 	TopicTickerLeader    logTopic = "TKLeader   "
+	TopicStart           logTopic = "Start/Req  "
 )
 
 type logLevel int

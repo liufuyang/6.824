@@ -270,6 +270,7 @@ type HeartBeatRequest struct {
 type HeartBeatReply struct {
 	Good bool // true if follower contained entry matching prevLogIndex and prevLogTerm - TODO
 	Term int
+	From int
 }
 
 // HeartBeat : While waiting for votes, a candidate may receive an
@@ -282,15 +283,46 @@ type HeartBeatReply struct {
 func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.From = rf.me
+
+	if rf.state == Leader {
+		rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
+		if rf.term == args.Term {
+			rf.DPrintf(TopicHB, "!!!!!!! PANIC !!!!!!! 2 leaders exist at the same time with the same term?\n")
+			reply.Good = false
+			reply.Term = rf.term
+			return
+		}
+		if rf.term > args.Term {
+			reply.Good = false
+			reply.Term = rf.term
+			return
+		} else { // rf.term < args.Term
+			rf.state = Follower
+			rf.votedFor = args.From
+			reply.Good = true
+			reply.Term = rf.term
+			rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+			return
+		}
+	}
+	if rf.state == Candidate {
+		rf.state = Follower
+		rf.votedFor = args.From
+		rf.term = args.Term
+	}
+
 	if args.Term >= rf.term {
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
 		// whose Term matches prevLogTerm (§5.3)
 		// First entry case is also covered as rf.lastLogIndex()=0=args.PrevLogIndex and terms are the same as 0
+		rf.DPrintf(TopicHB, "--------HeartBeat------ rf.lastLogIndex(): %v, args.PrevLogIndex: %v", rf.lastLogIndex(), args.PrevLogIndex)
 		if rf.lastLogIndex() < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Good = false
 			reply.Term = rf.term
 			rf.DPrintf(TopicHB, "false return as prevLogIndex/Term missmatch - args.From:%v, args.Term:%v, rf.lastLogIndex(): %v, prevLogIndex: %v\n",
 				args.From, args.Term, rf.lastLogIndex(), args.PrevLogIndex)
+			rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 			return
 		}
 		if args.Entries != nil {
@@ -409,6 +441,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	// Your code here (2B).
+	rf.DPrintf(TopicStart, "A new command %v comes in\n", command)
 	rf.log = append(rf.log, Entry{
 		Command: command,
 		Term:    rf.term,
@@ -493,8 +526,11 @@ func (rf *Raft) tickerAsLeader() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	c1 := make(chan *HeartBeatReply)
-	nextIndexes := rf.nextIndexes
-	matchIndexes := rf.matchIndexes
+	// specify some temp values to hold these index while having the lock, as rf.log might get changed (new command arrives) when unlocked below to allow the Call method runnable in goroutines
+	nextIndexesToBe := make([]int, len(rf.peers))
+	copy(nextIndexesToBe, rf.nextIndexes)
+	matchIndexesToBe := make([]int, len(rf.peers))
+	copy(matchIndexesToBe, rf.matchIndexes)
 
 	for i, other := range rf.peers {
 		peer := other // needed for solving data race
@@ -512,15 +548,16 @@ func (rf *Raft) tickerAsLeader() {
 			//
 			//  [x, 10, 20, 30]
 			//   0,  1,  2,  3  ---- rf.lastLogIndex()->3
-			//                  ---- rf.nextIndexes[i]->3 (only has 2 element, but by default nextIndex=lastLogIndex+1)
+			//                  ---- rf.nextIndexesTo[i]->3 (only has 2 element, but by default nextIndex=lastLogIndex+1)
 			//                  ---- so args.Entries = rf.log[3, 3+1]
+			rf.DPrintf(TopicTickerLeader, "------------ rf.lastLogIndex():%v rf.nextIndexes[%v]:%v \n", rf.lastLogIndex(), i, rf.nextIndexes[i])
 			if rf.lastLogIndex() >= rf.nextIndexes[i] {
 				args.Entries = rf.log[rf.nextIndexes[i] : rf.lastLogIndex()+1]
 				args.PrevLogIndex = rf.nextIndexes[i] - 1
 				args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 
-				nextIndexes[i] = rf.lastLogIndex() + 1
-				matchIndexes[i] = rf.lastLogIndex() // TODO - is this what to specific for matchIndexes?
+				nextIndexesToBe[i] = rf.lastLogIndex() + 1
+				matchIndexesToBe[i] = rf.lastLogIndex() // TODO - is this what to specific for matchIndexesToBe?
 			}
 			args.LeaderCommit = rf.commitIndex
 
@@ -541,22 +578,29 @@ func (rf *Raft) tickerAsLeader() {
 	currentTerm := rf.term
 	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
 	heartBeatCount := 1 // vote for myself
-	for i, _ := range rf.peers {
-		if i != rf.me {
+	for p, _ := range rf.peers {
+		if p != rf.me {
 			select {
 			case reply := <-c1:
+				i := reply.From
+				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
 				if reply.Term > currentTerm {
 					rf.mu.Lock()
 					rf.stepDownAsFollower(reply.Term)
 					return
 				}
 				if reply.Good { // Heartbeat/Commit Successful
-					rf.nextIndexes[i] = nextIndexes[i]
-					rf.matchIndexes[i] = matchIndexes[i]
+					rf.nextIndexes[i] = nextIndexesToBe[i]
+					rf.matchIndexes[i] = matchIndexesToBe[i]
 					heartBeatCount = heartBeatCount + 1
+					rf.DPrintf(TopicTickerLeader, "Good -------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
 				} else {
 					rf.nextIndexes[i] = max(1, rf.nextIndexes[i]-1)
+					rf.DPrintf(TopicTickerLeader, "Bad --------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
+					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex %v %v\n", i, i, rf.nextIndexes[i])
 				}
+			case <-time.After(rf.heartsBeatDuration / 3):
+				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
 			}
 		}
 	}
@@ -636,8 +680,8 @@ func (rf *Raft) tickerAsCandidate() {
 	rf.mu.Unlock()
 	voteCount := 1 // vote for myself
 	needToLoop := true
-	for i, _ := range rf.peers {
-		if i != rf.me && needToLoop {
+	for p, _ := range rf.peers {
+		if p != rf.me && needToLoop {
 			select {
 			case reply := <-c1:
 				if reply.Term > currentTerm {
