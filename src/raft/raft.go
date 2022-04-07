@@ -650,7 +650,7 @@ func (rf *Raft) tickerAsCandidate() {
 	defer rf.mu.Unlock()
 	if time.Now().After(rf.candidateStartingTime.Add(rf.getElectionTimeoutDuration())) {
 		rf.DPrintf(TopicTickerCandidate, "Step down from candidate to follower as timeout\n")
-		rf.stepDownAsFollower(rf.term)
+		rf.stepDownAsFollower(rf.term - 1)
 		return
 	}
 
