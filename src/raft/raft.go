@@ -218,6 +218,13 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	rf.DPrintf(TopicVR, "args.from:%v, args.Term:%v ", args.From, args.Term)
+
+	if rf.state != Follower {
+		reply.Agree = false
+		reply.Term = rf.term
+		return
+	}
+
 	if args.Term < rf.term {
 		reply.Agree = false
 		reply.Term = rf.term
@@ -226,12 +233,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if args.Term > rf.term {
 			// a new Term comes, setting it as follower
 			rf.stepDownAsFollower(args.Term)
-		}
-		// added a safer check - so to avoid situations like 3 candidate doing triangle voting making 3 leaders?
-		if args.Term == rf.term && rf.state != Follower {
-			reply.Agree = false
-			reply.Term = rf.term
-			return
 		}
 		// must be a follower here
 		if rf.state != Follower {
