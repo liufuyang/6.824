@@ -288,9 +288,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	if rf.state == Leader {
 		rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
 		if rf.term == args.Term {
-			rf.DPrintf(TopicHB, "!!!!!!! PANIC !!!!!!! 2 leaders exist at the same time with the same term?\n")
-			reply.Good = false
-			reply.Term = rf.term
+			panic("!!!!!!! *** PANIC *** !!!!!!! 2 leaders exist at the same time with the same term?\n")
 			return
 		}
 		if rf.term > args.Term {
@@ -597,9 +595,9 @@ func (rf *Raft) tickerAsLeader() {
 					heartBeatCount = heartBeatCount + 1
 					rf.DPrintf(TopicTickerLeader, "Good -------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
 				} else {
-					rf.nextIndexes[i] = max(1, rf.nextIndexes[i]-1)
 					rf.DPrintf(TopicTickerLeader, "Bad --------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
-					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex %v %v\n", i, i, rf.nextIndexes[i])
+					rf.nextIndexes[i] = max(1, rf.nextIndexes[i]-1)
+					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 			case <-time.After(rf.heartsBeatDuration / 3):
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
@@ -636,10 +634,6 @@ func (rf *Raft) tickerAsLeader() {
 			}
 		}
 
-	} else {
-		// leader doesn't get enough heartbeats from most of the candidate, step down
-		rf.DPrintf(TopicTickerLeader, "Got heartbeat count: %v - setting back to follower", heartBeatCount)
-		rf.stepDownAsFollower(rf.term)
 	}
 }
 func (rf *Raft) tickerAsCandidate() {
