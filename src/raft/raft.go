@@ -219,17 +219,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	rf.DPrintf(TopicVR, "args.from:%v, args.Term:%v ", args.From, args.Term)
 
-	if rf.state != Follower {
-		reply.Agree = false
-		reply.Term = rf.term
-		return
-	}
-
 	if args.Term < rf.term {
 		reply.Agree = false
 		reply.Term = rf.term
 		return
-	} else {
+	} else { // args.Term >= rf.term
+		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
+		//set currentTerm = T, convert to follower (§5.1)
+		rf.stepDownAsFollower(args.Term)
+		rf.votedFor = args.From
+
 		// must be a follower here
 		if rf.state != Follower {
 			panic("rf must be a Follower in this stage of RequestVote, but it is not.")
@@ -284,33 +283,42 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.From = rf.me
-
-	if rf.state == Leader {
-		rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
-		if rf.term == args.Term {
-			panic("!!!!!!! *** PANIC *** !!!!!!! 2 leaders exist at the same time with the same term?\n")
-			return
-		}
-		if rf.term > args.Term {
-			reply.Good = false
-			reply.Term = rf.term
-			return
-		} else { // rf.term < args.Term
-			rf.state = Follower
-			rf.votedFor = args.From
-			reply.Good = true
-			reply.Term = rf.term
-			rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-			return
-		}
-	}
-	if rf.state == Candidate {
-		rf.state = Follower
-		rf.votedFor = args.From
-		rf.term = args.Term
-	}
+	//
+	//if rf.state == Leader {
+	//	rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
+	//	if rf.term == args.Term {
+	//		panic("!!!!!!! *** PANIC *** !!!!!!! 2 leaders exist at the same time with the same term?\n")
+	//		return
+	//	}
+	//	if rf.term > args.Term {
+	//		reply.Good = false
+	//		reply.Term = rf.term
+	//		return
+	//	} else { // rf.term < args.Term
+	//		rf.state = Follower
+	//		rf.votedFor = args.From
+	//		reply.Good = true
+	//		reply.Term = rf.term
+	//		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+	//		return
+	//	}
+	//}
 
 	if args.Term >= rf.term {
+		if rf.state == Leader {
+			rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
+			if rf.term == args.Term {
+				panic("!!!!!!! *** PANIC *** !!!!!!! 2 leaders exist at the same time with the same term?\n")
+				return
+			}
+			rf.stepDownAsFollower(args.Term)
+			rf.votedFor = args.From
+		}
+		if rf.state == Candidate {
+			rf.stepDownAsFollower(args.Term)
+			rf.votedFor = args.From
+		}
+
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
 		// whose Term matches prevLogTerm (§5.3)
 		// First entry case is also covered as rf.lastLogIndex()=0=args.PrevLogIndex and terms are the same as 0
@@ -332,7 +340,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			// here we know rf.lastLogIndex() >= args.PrevLogIndex and rf.log[args.PrevLogIndex].Term == args.PrevLogTerm
 			for i, v := range rf.log[args.PrevLogIndex+1 : rf.lastLogIndex()+1] {
 				if i < len(args.Entries) && v.Term != args.Entries[i].Term {
-					rf.log = rf.log[:args.PrevLogTerm+1+i]
+					rf.log = rf.log[:args.PrevLogIndex+1+i] // here use Index Not Term!...
 					break
 				}
 			}
@@ -341,11 +349,12 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			// follower now: [x, 1, 2, 3 ] --- rf.lastLogIndex()->3, diff->1
 			diff := rf.lastLogIndex() - args.PrevLogIndex
 			if diff > 0 {
-				fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa\n")
+				fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa append log len:%v\n", len(args.Entries[diff:]))
 			}
-			for _, v := range args.Entries[diff:] {
-				rf.log = append(rf.log, v)
-			}
+			rf.log = append(rf.log, args.Entries[diff:]...)
+			//for _, v := range args.Entries[diff:] {
+			//	rf.log = append(rf.log, v)
+			//}
 		}
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 5.  If LeaderCommit > commitIndex, set commitIndex = min(LeaderCommit, index of last new entry)
 		// Follower commit
@@ -611,26 +620,40 @@ func (rf *Raft) tickerAsLeader() {
 
 		// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
 		// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
+		// We have to use a `validNExist` to firstly find a valid N then do the commit because there could be
+		// a special case that some uncommitted logs has a lower term should not be committed if there does not exist
+		// an uncommitted log with current term and also replicated. see https://youtu.be/YbZ3zDzDnrw?t=2136
+		// For example:
+		// If term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1}], then {106 1} should not be committed
+		// Then later if term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1} {106 3}], then {106 1} and {106 3} should both be committed when {106 3} is replicated
 		N := rf.commitIndex + 1
-		for ; ; N += 1 { // make it more efficient, jump more with N
+		validNExist := false
+		for ; N <= rf.lastLogIndex(); N = N + 1 { // make it more efficient, jump more with N
 			numberOfMatchIndexLEtoN := 1
 			for i, _ := range rf.peers {
 				if i != rf.me && rf.matchIndexes[i] >= N {
 					numberOfMatchIndexLEtoN = numberOfMatchIndexLEtoN + 1
 				}
 			}
-
-			if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 && rf.log[N].Term == currentTerm {
-				// Leader commit
-				rf.commitIndex = N
-				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[N].Command,
-					CommandIndex: N,
+			if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 {
+				if rf.log[N].Term == currentTerm {
+					validNExist = true
+					break
 				}
-				rf.DPrintf(TopicTickerLeader, "Leader committed new log\n")
 			} else {
 				break
+			}
+		}
+		if validNExist {
+			for i := rf.commitIndex + 1; i <= N; i++ {
+				// Leader commit
+				rf.commitIndex = i
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      rf.log[i].Command,
+					CommandIndex: i,
+				}
+				rf.DPrintf(TopicTickerLeader, "Leader committed new log\n")
 			}
 		}
 

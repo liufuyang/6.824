@@ -47,6 +47,8 @@ func getVerbosity() logLevel {
 		return trace
 	case "debug":
 		return debug
+	case "none":
+		return none
 	default:
 		return trace // change to none to stop log
 	}
