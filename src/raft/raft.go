@@ -284,26 +284,6 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.From = rf.me
-	//
-	//if rf.state == Leader {
-	//	rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
-	//	if rf.term == args.Term {
-	//		panic("!!!!!!! *** PANIC *** !!!!!!! 2 leaders exist at the same time with the same term?\n")
-	//		return
-	//	}
-	//	if rf.term > args.Term {
-	//		reply.Good = false
-	//		reply.Term = rf.term
-	//		return
-	//	} else { // rf.term < args.Term
-	//		rf.state = Follower
-	//		rf.votedFor = args.From
-	//		reply.Good = true
-	//		reply.Term = rf.term
-	//		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-	//		return
-	//	}
-	//}
 
 	if args.Term >= rf.term {
 		if rf.state == Leader {
@@ -537,9 +517,9 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) tickerAsLeader() {
-	rf.DPrintf(TopicTickerLeader, "Leader sends heartsbeats to others... \n")
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	rf.DPrintf(TopicTickerLeader, "Leader sends heartsbeats to others... \n")
 	c1 := make(chan *HeartBeatReply)
 	// specify some temp values to hold these index while having the lock, as rf.log might get changed (new command arrives) when unlocked below to allow the Call method runnable in goroutines
 	nextIndexesToBe := make([]int, len(rf.peers))
@@ -597,9 +577,9 @@ func (rf *Raft) tickerAsLeader() {
 			select {
 			case reply := <-c1:
 				i := reply.From
+				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
 				if reply.Term > currentTerm {
-					rf.mu.Lock()
 					rf.stepDownAsFollower(reply.Term)
 					return
 				}
@@ -613,8 +593,11 @@ func (rf *Raft) tickerAsLeader() {
 					rf.nextIndexes[i] = max(1, min(reply.LastLogIndex+1, rf.nextIndexes[i]-1)) // speed up
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
+				rf.mu.Unlock()
 			case <-time.After(time.Millisecond * 30):
+				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
+				rf.mu.Unlock()
 			}
 		}
 	}
@@ -716,7 +699,9 @@ func (rf *Raft) tickerAsCandidate() {
 					voteCount = voteCount + 1
 				}
 			case <-time.After(time.Millisecond * 30):
+				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Candidate call for vote to a peer timeout, giving up calling\n")
+				rf.mu.Unlock()
 			}
 		}
 	}
