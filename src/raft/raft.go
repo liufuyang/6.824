@@ -772,7 +772,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.followerTimeout = time.Millisecond * 150 // Follower Time Out
+	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration
 	rf.applyCh = applyCh
@@ -794,7 +794,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 // getElectionTimeoutDuration returns a duration between [rf.followerTimeout, rf.followerTimeout + 200)
 func (rf *Raft) getElectionTimeoutDuration() time.Duration {
-	intn := rf.rand.Intn(150)
+	intn := rf.rand.Intn(300)
 	return rf.followerTimeout + time.Millisecond*time.Duration(intn)
 }
 
