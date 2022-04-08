@@ -3,13 +3,15 @@
 Maybe not ideal/perfect but seems mostly working for 2B ...
 
 ```
-RAFT_LOG=none # none | debug | trace
-
-python3 dstest.py \
->    TestInitialElection2A TestReElection2A  TestManyElections2A \
->    TestBasicAgree2B TestRPCBytes2B TestFollowerFailure2B TestLeaderFailure2B TestFailAgree2B \
->    TestFailNoAgree2B TestConcurrentStarts2B TestRejoin2B TestBackup2B TestCount2B \
->    -p 10 -n 20 --race
+# For turning on or off logs, set `RAFT_LOG=none` # none | debug | trace
+RAFT_LOG=none python3 dstest.py \
+    TestInitialElection2A TestReElection2A  TestManyElections2A \
+    TestBasicAgree2B TestRPCBytes2B TestFollowerFailure2B TestLeaderFailure2B TestFailAgree2B \
+    TestFailNoAgree2B TestConcurrentStarts2B TestRejoin2B TestBackup2B TestCount2B \
+    TestPersist12C TestPersist22C TestPersist32C TestFigure82C TestUnreliableAgree2C TestFigure8Unreliable2C \
+    TestReliableChurn2C TestUnreliableChurn2C \
+    -p 10 -n 20 --race
+    
 Running with the race detector
 
 ┏━━━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━┳━━━━━━━━━━━━━━┓

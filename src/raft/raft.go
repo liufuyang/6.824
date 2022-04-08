@@ -23,6 +23,8 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
 	"fmt"
 	"math/rand"
 	//	"bytes"
@@ -131,64 +133,6 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 //
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-}
-
-//
-// restore previously persisted state.
-//
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
-}
-
-//
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
-}
-
-//
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
@@ -226,8 +170,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else { // args.Term >= rf.term
 		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower (§5.1)
+		defer rf.persist()
 		rf.stepDownAsFollower(args.Term)
-		rf.votedFor = args.From
 
 		// must be a follower here
 		if rf.state != Follower {
@@ -250,7 +194,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if notYetVoted || votedTheSameBefore {
 			rf.stepDownAsFollower(args.Term) // reset election timeout so if a follower is not
 			rf.votedFor = args.From          // make sure this is set again after the step above
-			rf.term = args.Term
 			reply.Agree = true
 			reply.Term = rf.term
 			rf.DPrintf(TopicVR, "Vote True for %v", args.From)
@@ -326,17 +269,29 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			for i, v := range rf.log[args.PrevLogIndex+1 : rf.lastLogIndex()+1] {
 				if i < len(args.Entries) && v.Term != args.Entries[i].Term {
 					rf.log = rf.log[:args.PrevLogIndex+1+i] // here use Index Not Term!...
+					rf.persist()
 					break
 				}
 			}
+
 			// [PAPER] AppendEntries-RPC - Receiver implementation: 4. Append any new Entries not already in the log
 			// leader:       [x, 1, 2, 3, 4] --- args.PrevLogIndex->2, Entries->[3,4]
 			// follower now: [x, 1, 2, 3 ] --- rf.lastLogIndex()->3, diff->1
 			diff := rf.lastLogIndex() - args.PrevLogIndex
-			if diff > 0 {
-				fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa entries has some duplicates append, diff:%v log len:%v\n", diff, len(args.Entries[diff:]))
+
+			if diff >= len(args.Entries) {
+				// for case like:
+				// log: [0, 1, 2, 3, 4, 5, 6] -------------------------> PrevLogIndex=2,
+				//               [3, 4,] ------------------------------> len(args.Entries)=2
+				//         diff := rf.lastLogIndex() - args.PrevLogIndex = (7-2) = 5 > 2 will cause issue
+				// So if after the above "cutting" step results this happens, we just do nothing as the logs has all the same element already.
+			} else {
+				if diff > 0 {
+					fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa entries has some duplicates append, diff:%v log len:%v\n", diff, len(args.Entries[diff:]))
+				}
+				rf.log = append(rf.log, args.Entries[diff:]...)
+				rf.persist()
 			}
-			rf.log = append(rf.log, args.Entries[diff:]...)
 		}
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 5.  If LeaderCommit > commitIndex, set commitIndex = min(LeaderCommit, index of last new entry)
 		// Follower commit
@@ -352,6 +307,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 						CommandIndex: startIndex + i,
 					}
 					rf.DPrintf(TopicTickerLeader, "Follower committed new log with index %v\n", startIndex+i)
+					rf.persist()
 				}
 			}
 		}
@@ -435,6 +391,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    rf.term,
 	})
+	rf.persist()
 
 	return rf.lastLogIndex(), rf.term, true
 }
@@ -522,7 +479,6 @@ func (rf *Raft) tickerAsLeader() {
 	copy(matchIndexesToBe, rf.matchIndexes)
 
 	for i, other := range rf.peers {
-		peer := other // needed for solving data race
 		if i != rf.me {
 			var args *HeartBeatRequest = &HeartBeatRequest{
 				From:         rf.me,
@@ -549,7 +505,7 @@ func (rf *Raft) tickerAsLeader() {
 			}
 			args.LeaderCommit = rf.commitIndex
 
-			go func() {
+			go func(target int, peer *labrpc.ClientEnd) {
 				if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
 					if reply.Good {
 						c1 <- reply
@@ -558,9 +514,9 @@ func (rf *Raft) tickerAsLeader() {
 				}
 				c1 <- reply
 				rf.mu.Lock()
-				rf.DPrintf(TopicTickerLeader, "Leader<%v> sends heartbeat Term %v to Node<%v> failed\n", args.From, args.Term, i)
+				rf.DPrintf(TopicTickerLeader, "Leader<%v> sends heartbeat Term %v to Node<%v> failed\n", args.From, args.Term, target)
 				rf.mu.Unlock()
-			}()
+			}(i, other)
 		}
 	}
 	currentTerm := rf.term
@@ -596,7 +552,7 @@ func (rf *Raft) tickerAsLeader() {
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 				rf.mu.Unlock()
-			case <-time.After(time.Millisecond * 10):
+			case <-time.After(time.Millisecond * 100):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -642,11 +598,13 @@ func (rf *Raft) tickerAsLeader() {
 					CommandIndex: i,
 				}
 				rf.DPrintf(TopicTickerLeader, "Leader committed new log\n")
+				rf.persist()
 			}
 		}
 	}
 	rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
 }
+
 func (rf *Raft) tickerAsCandidate() {
 	//  A candidate continues in this state until one of three things happens:
 	//  (a) it wins the election,
@@ -661,11 +619,10 @@ func (rf *Raft) tickerAsCandidate() {
 		return
 	}
 
-	rf.DPrintf(TopicTickerLeader, "Candidate calls all others for vote\n")
+	rf.DPrintf(TopicTickerCandidate, "Candidate calls all others for vote\n")
 	c1 := make(chan *RequestVoteReply)
 	for i, other := range rf.peers {
 		if i != rf.me {
-			peer := other
 			var args *RequestVoteArgs = &RequestVoteArgs{
 				From:         rf.me,
 				Term:         rf.term,
@@ -673,7 +630,7 @@ func (rf *Raft) tickerAsCandidate() {
 				LastLogTerm:  rf.lastLogTerm(),
 			}
 			var reply *RequestVoteReply = &RequestVoteReply{}
-			go func() {
+			go func(peer *labrpc.ClientEnd) {
 				if ok := peer.Call("Raft.RequestVote", args, reply); ok {
 					if reply.Agree {
 						c1 <- reply
@@ -681,7 +638,7 @@ func (rf *Raft) tickerAsCandidate() {
 					}
 				}
 				c1 <- reply
-			}()
+			}(other)
 		}
 	}
 	currentTerm := rf.term
@@ -699,9 +656,9 @@ func (rf *Raft) tickerAsCandidate() {
 				if reply.Agree {
 					voteCount = voteCount + 1
 				}
-			case <-time.After(time.Millisecond * 10):
+			case <-time.After(time.Millisecond * 100):
 				rf.mu.Lock()
-				rf.DPrintf(TopicTickerLeader, "Candidate call for vote to a peer timeout, giving up calling\n")
+				rf.DPrintf(TopicTickerCandidate, "Candidate call for vote to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
 			}
 		}
@@ -719,6 +676,7 @@ func (rf *Raft) tickerAsCandidate() {
 	if voteCount >= len(rf.peers)/2+1 {
 		rf.DPrintf(TopicTickerCandidate, "---L--- Step up as leader\n")
 		rf.state = Leader
+		rf.persist()
 		for i, _ := range rf.peers {
 			if i != rf.me {
 				rf.nextIndexes[i] = rf.commitIndex + 1
@@ -726,6 +684,7 @@ func (rf *Raft) tickerAsCandidate() {
 			}
 		}
 	} else {
+		// reset election timer
 		rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
 	}
 }
@@ -778,6 +737,72 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	return rf
 }
 
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
+func (rf *Raft) persist() {
+	// Your code here (2C).
+	// Example:
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.term)
+	e.Encode(rf.log)
+	e.Encode(rf.commitIndex)
+	e.Encode(rf.lastApplied)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+}
+
+//
+// restore previously persisted state.
+//
+func (rf *Raft) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	// Example:
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var log []Entry
+	var commitIndex int
+	var lastApplied int
+	if d.Decode(&term) != nil ||
+		d.Decode(&log) != nil ||
+		d.Decode(&commitIndex) != nil ||
+		d.Decode(&lastApplied) != nil {
+		rf.DPrintf(TopicPersistError, "readPersist failed?!")
+	} else {
+		rf.term = term
+		rf.log = log
+		rf.commitIndex = commitIndex
+		rf.lastApplied = lastApplied
+	}
+}
+
+//
+// A service wants to switch to snapshot.  Only do so if Raft hasn't
+// have more recent info since it communicate the snapshot on applyCh.
+//
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+
+	// Your code here (2D).
+
+	return true
+}
+
+// the service says it has created a snapshot that has
+// all info up to and including index. this means the
+// service no longer needs the log through (and including)
+// that index. Raft should now trim its log as much as possible.
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	// Your code here (2D).
+
+}
+
 // getElectionTimeoutDuration returns a duration between [rf.followerTimeout, rf.followerTimeout + 200)
 func (rf *Raft) getElectionTimeoutDuration() time.Duration {
 	intn := rf.rand.Intn(300)
@@ -787,7 +812,9 @@ func (rf *Raft) getElectionTimeoutDuration() time.Duration {
 func (rf *Raft) DPrintf(topic logTopic, format string, a ...interface{}) {
 	rfTrace := fmt.Sprintf("Node<%v> [%v]|Term(%v)|VotedFor(%v)|CIndex(%v)|%v",
 		rf.me, rf.state, rf.term, rf.votedFor, rf.commitIndex, rf.log)
-	TPrintf(topic, rfTrace, format, a...)
+	rfDebug := fmt.Sprintf("Node<%v> [%v]|Term(%v)|VotedFor(%v)|CIndex(%v)|",
+		rf.me, rf.state, rf.term, rf.votedFor, rf.commitIndex)
+	TPrintf(topic, rfTrace, rfDebug, format, a...)
 }
 
 func min(a, b int) int {
