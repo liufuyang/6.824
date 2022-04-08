@@ -271,6 +271,7 @@ type HeartBeatReply struct {
 	Term         int
 	From         int
 	LastLogIndex int
+	LastLogTerm  int
 }
 
 // HeartBeat : While waiting for votes, a candidate may receive an
@@ -308,11 +309,8 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			reply.Good = false
 			reply.Term = rf.term
 
-			if rf.lastLogIndex() >= args.PrevLogIndex {
-				// here means PrevLogTerm miss match
-				rf.log = rf.log[:args.PrevLogIndex]
-			}
 			reply.LastLogIndex = rf.lastLogIndex() // speed up
+			reply.LastLogTerm = rf.lastLogTerm()
 
 			rf.DPrintf(TopicHB, "false return as prevLogIndex/Term missmatch - args.From:%v, args.Term:%v, rf.lastLogIndex(): %v, prevLogIndex: %v\n",
 				args.From, args.Term, rf.lastLogIndex(), args.PrevLogIndex)
@@ -340,9 +338,6 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 				fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa entries has some duplicates append, diff:%v log len:%v\n", diff, len(args.Entries[diff:]))
 			}
 			rf.log = append(rf.log, args.Entries[diff:]...)
-			//for _, v := range args.Entries[diff:] {
-			//	rf.log = append(rf.log, v)
-			//}
 		}
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 5.  If LeaderCommit > commitIndex, set commitIndex = min(LeaderCommit, index of last new entry)
 		// Follower commit
@@ -590,7 +585,15 @@ func (rf *Raft) tickerAsLeader() {
 					rf.DPrintf(TopicTickerLeader, "Good -------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
 				} else {
 					rf.DPrintf(TopicTickerLeader, "Bad --------------------------------------rf.nextIndexes[%v]=%v, reply.LastLogIndex=%v\n", i, rf.nextIndexes[i], reply.LastLogIndex)
-					rf.nextIndexes[i] = max(1, min(reply.LastLogIndex+1, rf.nextIndexes[i]-1)) // speed up
+					// speed up
+					old := rf.nextIndexes[i] - 1
+					newNextI := min(reply.LastLogIndex+1, rf.nextIndexes[i]-1)
+					for ; newNextI > 1 && rf.log[newNextI].Term > reply.LastLogTerm; newNextI-- {
+					}
+					rf.nextIndexes[i] = max(1, newNextI) // speed up
+					if d := old - rf.nextIndexes[i]; d > 0 {
+						fmt.Printf("----------------------- speed up ---------------- nextIndexes old-new :%v\n", d)
+					}
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 				rf.mu.Unlock()
