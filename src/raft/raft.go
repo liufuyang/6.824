@@ -171,7 +171,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower (§5.1)
 		defer rf.persist()
-		rf.stepDownAsFollower(args.Term)
+		rf.stepDownAsFollower(args.Term) // also clear up votedFor, seems important
 
 		// must be a follower here
 		if rf.state != Follower {
@@ -237,10 +237,12 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			}
 			rf.stepDownAsFollower(args.Term)
 			rf.votedFor = args.From
+			defer rf.persist()
 		}
 		if rf.state == Candidate {
 			rf.stepDownAsFollower(args.Term)
 			rf.votedFor = args.From
+			defer rf.persist()
 		}
 
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -552,7 +554,7 @@ func (rf *Raft) tickerAsLeader() {
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 				rf.mu.Unlock()
-			case <-time.After(time.Millisecond * 100):
+			case <-time.After(time.Millisecond * 30):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -656,7 +658,7 @@ func (rf *Raft) tickerAsCandidate() {
 				if reply.Agree {
 					voteCount = voteCount + 1
 				}
-			case <-time.After(time.Millisecond * 100):
+			case <-time.After(time.Millisecond * 30):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerCandidate, "Candidate call for vote to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -717,7 +719,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.followerTimeout = time.Millisecond * 300 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
+	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
 	rf.applyCh = applyCh
@@ -748,6 +750,7 @@ func (rf *Raft) persist() {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.term)
+	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
 	e.Encode(rf.commitIndex)
 	e.Encode(rf.lastApplied)
@@ -767,16 +770,19 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var term int
+	var votedFor int
 	var log []Entry
 	var commitIndex int
 	var lastApplied int
 	if d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
 		d.Decode(&log) != nil ||
 		d.Decode(&commitIndex) != nil ||
 		d.Decode(&lastApplied) != nil {
 		rf.DPrintf(TopicPersistError, "readPersist failed?!")
 	} else {
 		rf.term = term
+		rf.votedFor = votedFor
 		rf.log = log
 		rf.commitIndex = commitIndex
 		rf.lastApplied = lastApplied
