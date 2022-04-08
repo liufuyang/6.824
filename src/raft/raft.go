@@ -290,8 +290,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		if rf.state == Leader {
 			rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
 			if rf.term == args.Term {
-				panic("!!!!!!! *** PANIC *** !!!!!!! 2 leaders exist at the same time with the same term?\n")
-				return
+				rf.DPrintf(TopicHB, "!!!!!!! *** THIS SHOULD RARELY HAPPEN *** !!!!!!! 2 leaders exist at the same time with the same term. Only happens when no log difference on all nodes.\n")
 			}
 			rf.stepDownAsFollower(args.Term)
 			rf.votedFor = args.From
@@ -485,8 +484,8 @@ func (rf *Raft) ticker() {
 		// time.Sleep().
 		rf.mu.Lock()
 		if time.Now().Before(rf.electionTimeoutTime) { // don't go elect if rf.electionTimeoutTime is after now
-			time.Sleep(time.Millisecond * 5) // sleep for a while
 			rf.mu.Unlock()
+			time.Sleep(time.Millisecond * 10) // sleep for a while
 			continue
 		}
 
@@ -597,7 +596,7 @@ func (rf *Raft) tickerAsLeader() {
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 				rf.mu.Unlock()
-			case <-time.After(time.Millisecond * 30):
+			case <-time.After(time.Millisecond * 10):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -607,8 +606,6 @@ func (rf *Raft) tickerAsLeader() {
 	rf.mu.Lock()
 
 	if heartBeatCount >= len(rf.peers)/2+1 {
-		rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
-
 		// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
 		// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
 		// We have to use a `validNExist` to firstly find a valid N then do the commit because there could be
@@ -647,8 +644,8 @@ func (rf *Raft) tickerAsLeader() {
 				rf.DPrintf(TopicTickerLeader, "Leader committed new log\n")
 			}
 		}
-
 	}
+	rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
 }
 func (rf *Raft) tickerAsCandidate() {
 	//  A candidate continues in this state until one of three things happens:
@@ -664,6 +661,7 @@ func (rf *Raft) tickerAsCandidate() {
 		return
 	}
 
+	rf.DPrintf(TopicTickerLeader, "Candidate calls all others for vote\n")
 	c1 := make(chan *RequestVoteReply)
 	for i, other := range rf.peers {
 		if i != rf.me {
@@ -701,7 +699,7 @@ func (rf *Raft) tickerAsCandidate() {
 				if reply.Agree {
 					voteCount = voteCount + 1
 				}
-			case <-time.After(time.Millisecond * 30):
+			case <-time.After(time.Millisecond * 10):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Candidate call for vote to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -760,9 +758,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
+	rf.followerTimeout = time.Millisecond * 300 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
-	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration
+	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
 	rf.applyCh = applyCh
 	rf.nextIndexes = make([]int, len(peers))
 	rf.matchIndexes = make([]int, len(peers))

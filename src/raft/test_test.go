@@ -1,5 +1,14 @@
 package raft
 
+import (
+	"fmt"
+	"math/rand"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+)
+
 //
 // Raft tests.
 //
@@ -11,13 +20,16 @@ package raft
 // RAFT_LOG=trace go test -race -run 2A
 // RAFT_LOG=debug go test -race -run 2B
 //
+// python3 dstest.py --help
+// python3 dstest.py 2A 2B  -p 20 -n 20
 
-import "testing"
-import "fmt"
-import "time"
-import "math/rand"
-import "sync/atomic"
-import "sync"
+/*
+   python3 dstest.py \
+       TestInitialElection2A TestReElection2A  TestManyElections2A \
+       TestBasicAgree2B TestRPCBytes2B TestFollowerFailure2B TestLeaderFailure2B TestFailAgree2B \
+       TestFailNoAgree2B TestConcurrentStarts2B TestRejoin2B TestBackup2B TestCount2B \
+       -p 20 -n 20 --race
+*/
 
 // The tester generously allows solutions to complete elections in one second
 // (much more than the paper's range of timeouts).

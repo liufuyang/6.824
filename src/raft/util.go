@@ -72,11 +72,12 @@ func TPrintf(topic logTopic, traceStr string, format string, a ...interface{}) {
 		return
 	}
 
-	time := time.Since(debugStart).Microseconds()
-	time /= 100
+	time := time.Since(debugStart).Milliseconds()
+	timeMS := time % 1000
+	time1000MS := time / 1000
 	prefix := ""
 	if debugVerbosity == trace {
-		prefix = fmt.Sprintf("%06d [%v] |%v| - ", time, topic, traceStr)
+		prefix = fmt.Sprintf("%03d|%03dMS [%v] |%v| - ", time1000MS, timeMS, topic, traceStr)
 	} else if debugVerbosity == debug {
 		prefix = fmt.Sprintf("%06d [%v] - ", time, topic)
 	}
