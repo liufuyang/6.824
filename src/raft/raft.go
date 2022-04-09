@@ -74,14 +74,14 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// for leader election
-	term                  int // Persistent state on all servers: (Updated on stable storage before responding to RPCs)
-	votedFor              int // candidateId that received vote in current term (or null if none) Persistent state on all servers: (Updated on stable storage before responding to RPCs)
-	state                 ServerState
-	followerTimeout       time.Duration
-	rand                  *rand.Rand
-	electionTimeoutTime   time.Time
-	heartsBeatDuration    time.Duration
-	candidateStartingTime time.Time
+	term                int // Persistent state on all servers: (Updated on stable storage before responding to RPCs)
+	votedFor            int // candidateId that received vote in current term (or null if none) Persistent state on all servers: (Updated on stable storage before responding to RPCs)
+	state               ServerState
+	followerTimeout     time.Duration
+	rand                *rand.Rand
+	electionTimeoutTime time.Time
+	heartsBeatDuration  time.Duration
+	//candidateStartingTime time.Time
 
 	// for 2B - apply commit
 	applyCh chan ApplyMsg
@@ -171,7 +171,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower (§5.1)
 		defer rf.persist()
-		rf.stepDownAsFollower(args.Term) // also clear up votedFor, seems important
+
+		// Leader or Candidate do not vote for others
+		if args.Term == rf.term && rf.state != Follower {
+			reply.Agree = false
+			reply.Term = rf.term
+			return
+		}
+		if args.Term > rf.term {
+			rf.stepDownAsFollower(args.Term) // also clear up votedFor, as we haven't voted yet seems important
+		}
 
 		// must be a follower here
 		if rf.state != Follower {
@@ -229,17 +238,22 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	defer rf.mu.Unlock()
 	reply.From = rf.me
 
-	if args.Term >= rf.term {
+	if args.Term < rf.term {
+		// [PAPER] AppendEntries-RPC - Receiver implementation: 1. Reply false if Term < currentTerm (§5.1)
+		// allow election timeout later when receiving AppendEntries RPC from low Term calls
+		reply.Good = false
+		reply.Term = rf.term
+		rf.DPrintf(TopicHB, "args.From:%v, args.Term:%v --- Ignored\n", args.From, args.Term)
+		return // ignore
+	} else { // args.Term >= rf.term
 		if rf.state == Leader {
 			rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
 			if rf.term == args.Term {
 				rf.DPrintf(TopicHB, "!!!!!!! *** THIS SHOULD RARELY HAPPEN *** !!!!!!! 2 leaders exist at the same time with the same term. Only happens when no log difference on all nodes.\n")
+				panic("!!! 2 leaders exist at the same time with the same term!!!")
 			}
-			rf.stepDownAsFollower(args.Term)
-			rf.votedFor = args.From
-			defer rf.persist()
 		}
-		if rf.state == Candidate {
+		if args.Term > rf.term {
 			rf.stepDownAsFollower(args.Term)
 			rf.votedFor = args.From
 			defer rf.persist()
@@ -321,13 +335,6 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		reply.Term = rf.term
 		rf.DPrintf(TopicHB, "args.From:%v, args.Term:%v --- Reply Good\n", args.From, args.Term)
 		return
-	} else {
-		// [PAPER] AppendEntries-RPC - Receiver implementation: 1. Reply false if Term < currentTerm (§5.1)
-		// allow election timeout later when receiving AppendEntries RPC from low Term calls
-		reply.Good = false
-		reply.Term = rf.term
-		rf.DPrintf(TopicHB, "args.From:%v, args.Term:%v --- Ignored\n", args.From, args.Term)
-		return // ignore
 	}
 }
 
@@ -453,10 +460,8 @@ func (rf *Raft) ticker() {
 			rf.tickerAsLeader()
 			continue
 		} else if rf.state == Follower {
-			rf.term = rf.term + 1 // --------- only place that bumps Term ------------
 			rf.state = Candidate
 			rf.votedFor = -1
-			rf.candidateStartingTime = time.Now()
 			rf.DPrintf(TopicTickerFollower, "----- step up as candidate -----\n")
 			rf.mu.Unlock()
 			continue
@@ -554,6 +559,7 @@ func (rf *Raft) tickerAsLeader() {
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 				rf.mu.Unlock()
+			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
 			case <-time.After(time.Millisecond * 30):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
@@ -562,6 +568,14 @@ func (rf *Raft) tickerAsLeader() {
 		}
 	}
 	rf.mu.Lock()
+	// TODO: after Lock, check states again
+
+	// check whether this candidate has been set back to Follower
+	if rf.state == Follower {
+		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		return
+	}
 
 	if heartBeatCount >= len(rf.peers)/2+1 {
 		// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
@@ -615,11 +629,7 @@ func (rf *Raft) tickerAsCandidate() {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if time.Now().After(rf.candidateStartingTime.Add(rf.getElectionTimeoutDuration())) {
-		rf.DPrintf(TopicTickerCandidate, "Step down from candidate to follower as timeout\n")
-		rf.stepDownAsFollower(rf.term - 1)
-		return
-	}
+	rf.term = rf.term + 1 // --------- only place that bumps Term ------------
 
 	rf.DPrintf(TopicTickerCandidate, "Candidate calls all others for vote\n")
 	c1 := make(chan *RequestVoteReply)
@@ -639,6 +649,7 @@ func (rf *Raft) tickerAsCandidate() {
 						return
 					}
 				}
+				fmt.Printf("-----------<<<<<<<<<<<<<<<<< No reply received? --------------\n")
 				c1 <- reply
 			}(other)
 		}
@@ -658,6 +669,7 @@ func (rf *Raft) tickerAsCandidate() {
 				if reply.Agree {
 					voteCount = voteCount + 1
 				}
+			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
 			case <-time.After(time.Millisecond * 30):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerCandidate, "Candidate call for vote to a peer timeout, giving up calling\n")
@@ -719,7 +731,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
+	rf.followerTimeout = time.Millisecond * 150 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
 	rf.applyCh = applyCh
