@@ -84,7 +84,7 @@ type Raft struct {
 	heartsBeatDuration        time.Duration
 	remoteCallTimeoutDuration time.Duration
 	tickerContext             context.Context
-	tickerContextCancel       context.CancelFunc
+	tickerContextCancelHandle context.CancelFunc
 
 	// for 2B - apply commit
 	applyCh chan ApplyMsg
@@ -181,7 +181,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower (§5.1)
 		if args.Term > rf.term {
-			rf.tickerContextCancel()
+			rf.tickerContextCancel()         // RequestVote cancel context as args.Term > rf.term
 			rf.stepDownAsFollower(args.Term) // also clear up votedFor, as we haven't voted yet seems important
 			rf.persist()                     // at RequestVote term updates
 		}
@@ -266,8 +266,8 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		rf.stepDownAsFollower(args.Term) // refresh election timeout
 		rf.votedFor = args.From          // keep votedFor
 		if args.Term > rf.term {
-			rf.tickerContextCancel()
-			rf.persist() // at HeartBeat term updates
+			rf.tickerContextCancel() // HeatBeat cancel context as args.Term > rf.term
+			rf.persist()             // at HeartBeat term updates
 		}
 
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -455,7 +455,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	// Setup tickerContext
 	ctx := context.Background()
-	rf.tickerContext, rf.tickerContextCancel = context.WithCancel(ctx)
+	rf.tickerContext, rf.tickerContextCancelHandle = context.WithCancel(ctx)
 
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
@@ -470,7 +470,7 @@ func (rf *Raft) ticker() {
 
 		// Setup tickerContext
 		ctx := context.Background()
-		rf.tickerContext, rf.tickerContextCancel = context.WithCancel(ctx)
+		rf.tickerContext, rf.tickerContextCancelHandle = context.WithCancel(ctx)
 
 		if rf.state == Leader {
 			rf.mu.Unlock()
@@ -523,9 +523,11 @@ func (rf *Raft) tickerAsLeader() {
 			//                  ---- so args.Entries = rf.log[3, 3+1]
 			rf.DPrintf(TopicTickerLeader, "Leader state before sending ------------ rf.lastLogIndex():%v rf.nextIndexes[%v]:%v \n", rf.lastLogIndex(), i, rf.nextIndexes[i])
 			if rf.lastLogIndex() >= rf.nextIndexes[i] {
-				args.Entries = rf.log[rf.nextIndexes[i] : rf.lastLogIndex()+1]
-				nextIndexesToBe[i] = rf.lastLogIndex() + 1
-				matchIndexesToBe[i] = rf.lastLogIndex() // TODO - is this what to specific for matchIndexesToBe?
+				// limit length of entries
+				entryLength := min(128, rf.lastLogIndex()-rf.nextIndexes[i])
+				args.Entries = rf.log[rf.nextIndexes[i] : rf.nextIndexes[i]+entryLength+1]
+				nextIndexesToBe[i] = rf.nextIndexes[i] + entryLength + 1
+				matchIndexesToBe[i] = rf.nextIndexes[i] + entryLength // TODO - is this what to specific for matchIndexesToBe?
 			}
 			args.LeaderCommit = rf.commitIndex
 
@@ -557,7 +559,7 @@ func (rf *Raft) tickerAsLeader() {
 				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
 				replyCount = replyCount + 1
 				if replyCount >= len(rf.peers)/2+1 {
-					rf.tickerContextCancel() // cancel context, no need to wait for the rest
+					rf.tickerContextCancel() // tickerAsLeader cancel context, no need to wait for the rest
 				}
 				if reply.Term > currentTerm {
 					termUpdated = true
@@ -784,6 +786,18 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.ticker()
 
 	return rf
+}
+
+func (rf *Raft) tickerContextCancel() {
+	go func() {
+		// for passing TestRPCBytes2B
+		// we let the leader ticker wait for a little while after got enough heartbeats so the reset beats
+		// can be received as well so let nextIndex updated, so to avoid sending the beats again
+		time.Sleep(time.Millisecond * 30)
+		rf.mu.Lock()
+		rf.tickerContextCancelHandle()
+		rf.mu.Unlock()
+	}()
 }
 
 //
