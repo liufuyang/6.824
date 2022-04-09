@@ -25,6 +25,7 @@ package raft
 import (
 	"6.824/labgob"
 	"bytes"
+	"context"
 	"fmt"
 	"math/rand"
 	//	"bytes"
@@ -82,6 +83,8 @@ type Raft struct {
 	electionTimeoutTime       time.Time
 	heartsBeatDuration        time.Duration
 	remoteCallTimeoutDuration time.Duration
+	tickerContext             context.Context
+	tickerContextCancel       context.CancelFunc
 
 	// for 2B - apply commit
 	applyCh chan ApplyMsg
@@ -163,6 +166,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	rf.DPrintf(TopicVR, "args.from:%v, args.Term:%v ", args.From, args.Term)
 
+	rf.tickerContextCancel()
+
 	if args.Term < rf.term {
 		reply.Agree = false
 		reply.Term = rf.term
@@ -238,6 +243,8 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.From = rf.me
+
+	rf.tickerContextCancel()
 
 	if args.Term < rf.term {
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 1. Reply false if Term < currentTerm (§5.1)
@@ -443,6 +450,9 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
+	// Setup tickerContext
+	ctx := context.Background()
+	rf.tickerContext, rf.tickerContextCancel = context.WithTimeout(ctx, rf.remoteCallTimeoutDuration)
 
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
@@ -454,6 +464,10 @@ func (rf *Raft) ticker() {
 			time.Sleep(time.Millisecond * 10) // sleep for a while
 			continue
 		}
+
+		// Setup tickerContext
+		ctx := context.Background()
+		rf.tickerContext, rf.tickerContextCancel = context.WithTimeout(ctx, rf.remoteCallTimeoutDuration)
 
 		if rf.state == Leader {
 			rf.mu.Unlock()
@@ -544,6 +558,10 @@ func (rf *Raft) tickerAsLeader() {
 					rf.nextIndexes[i] = nextIndexesToBe[i]
 					rf.matchIndexes[i] = matchIndexesToBe[i]
 					heartBeatCount = heartBeatCount + 1
+
+					if heartBeatCount >= len(rf.peers)/2+1 {
+						rf.tickerContextCancel()
+					}
 					rf.DPrintf(TopicTickerLeader, "Good -------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
 				} else {
 					rf.DPrintf(TopicTickerLeader, "Bad --------------------------------------rf.nextIndexes[%v]=%v, reply.LastLogIndex=%v\n", i, rf.nextIndexes[i], reply.LastLogIndex)
@@ -560,7 +578,7 @@ func (rf *Raft) tickerAsLeader() {
 				}
 				rf.mu.Unlock()
 			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
-			case <-time.After(rf.remoteCallTimeoutDuration):
+			case <-rf.tickerContext.Done(): // time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -671,9 +689,12 @@ func (rf *Raft) tickerAsCandidate() {
 				}
 				if reply.Agree {
 					voteCount = voteCount + 1
+					if voteCount >= len(rf.peers)/2+1 {
+						rf.tickerContextCancel()
+					}
 				}
 			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
-			case <-time.After(rf.remoteCallTimeoutDuration):
+			case <-rf.tickerContext.Done(): // time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerCandidate, "Candidate call for vote to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -743,7 +764,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
-	rf.remoteCallTimeoutDuration = time.Millisecond * 10
+	rf.remoteCallTimeoutDuration = time.Millisecond * 250
 	rf.applyCh = applyCh
 	rf.nextIndexes = make([]int, len(peers))
 	rf.matchIndexes = make([]int, len(peers))
