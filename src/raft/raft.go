@@ -74,14 +74,14 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// for leader election
-	term                int // Persistent state on all servers: (Updated on stable storage before responding to RPCs)
-	votedFor            int // candidateId that received vote in current term (or null if none) Persistent state on all servers: (Updated on stable storage before responding to RPCs)
-	state               ServerState
-	followerTimeout     time.Duration
-	rand                *rand.Rand
-	electionTimeoutTime time.Time
-	heartsBeatDuration  time.Duration
-	//candidateStartingTime time.Time
+	term                      int // Persistent state on all servers: (Updated on stable storage before responding to RPCs)
+	votedFor                  int // candidateId that received vote in current term (or null if none) Persistent state on all servers: (Updated on stable storage before responding to RPCs)
+	state                     ServerState
+	followerTimeout           time.Duration
+	rand                      *rand.Rand
+	electionTimeoutTime       time.Time
+	heartsBeatDuration        time.Duration
+	remoteCallTimeoutDuration time.Duration
 
 	// for 2B - apply commit
 	applyCh chan ApplyMsg
@@ -560,7 +560,7 @@ func (rf *Raft) tickerAsLeader() {
 				}
 				rf.mu.Unlock()
 			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
-			case <-time.After(time.Millisecond * 30):
+			case <-time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -673,7 +673,7 @@ func (rf *Raft) tickerAsCandidate() {
 					voteCount = voteCount + 1
 				}
 			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
-			case <-time.After(time.Millisecond * 30):
+			case <-time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerCandidate, "Candidate call for vote to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -743,6 +743,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
+	rf.remoteCallTimeoutDuration = time.Millisecond * 10
 	rf.applyCh = applyCh
 	rf.nextIndexes = make([]int, len(peers))
 	rf.matchIndexes = make([]int, len(peers))
