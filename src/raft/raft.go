@@ -168,9 +168,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.term
 		return
 	} else { // args.Term >= rf.term
-		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
-		//set currentTerm = T, convert to follower (§5.1)
-		defer rf.persist()
 
 		// Leader or Candidate do not vote for others
 		if args.Term == rf.term && rf.state != Follower {
@@ -178,8 +175,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.Term = rf.term
 			return
 		}
+		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
+		//set currentTerm = T, convert to follower (§5.1)
 		if args.Term > rf.term {
 			rf.stepDownAsFollower(args.Term) // also clear up votedFor, as we haven't voted yet seems important
+			rf.persist()                     // at RequestVote term updates
 		}
 
 		// must be a follower here
@@ -205,6 +205,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			rf.votedFor = args.From          // make sure this is set again after the step above
 			reply.Agree = true
 			reply.Term = rf.term
+			rf.persist() // at RequestVote term and votedFor updates
 			rf.DPrintf(TopicVR, "Vote True for %v", args.From)
 		}
 	}
@@ -256,7 +257,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		if args.Term > rf.term {
 			rf.stepDownAsFollower(args.Term)
 			rf.votedFor = args.From
-			defer rf.persist()
+			rf.persist() // at HeartBeat term updates
 		}
 
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -285,7 +286,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			for i, v := range rf.log[args.PrevLogIndex+1 : rf.lastLogIndex()+1] {
 				if i < len(args.Entries) && v.Term != args.Entries[i].Term {
 					rf.log = rf.log[:args.PrevLogIndex+1+i] // here use Index Not Term!...
-					rf.persist()
+					rf.persist()                            // at HeartBeat log updates
 					break
 				}
 			}
@@ -306,7 +307,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 					fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa entries has some duplicates append, diff:%v log len:%v\n", diff, len(args.Entries[diff:]))
 				}
 				rf.log = append(rf.log, args.Entries[diff:]...)
-				rf.persist()
+				rf.persist() // at HeartBeat log updates
 			}
 		}
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 5.  If LeaderCommit > commitIndex, set commitIndex = min(LeaderCommit, index of last new entry)
@@ -323,7 +324,6 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 						CommandIndex: startIndex + i,
 					}
 					rf.DPrintf(TopicTickerLeader, "Follower committed new log with index %v\n", startIndex+i)
-					rf.persist()
 				}
 			}
 		}
@@ -400,7 +400,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    rf.term,
 	})
-	rf.persist()
+	rf.persist() // at Start log updates
 
 	return rf.lastLogIndex(), rf.term, true
 }
@@ -613,7 +613,6 @@ func (rf *Raft) tickerAsLeader() {
 					CommandIndex: i,
 				}
 				rf.DPrintf(TopicTickerLeader, "Leader committed new log\n")
-				rf.persist()
 			}
 		}
 	}
@@ -689,7 +688,6 @@ func (rf *Raft) tickerAsCandidate() {
 	if voteCount >= len(rf.peers)/2+1 {
 		rf.DPrintf(TopicTickerCandidate, "---L--- Step up as leader\n")
 		rf.state = Leader
-		rf.persist()
 		for i, _ := range rf.peers {
 			if i != rf.me {
 				rf.nextIndexes[i] = rf.commitIndex + 1
@@ -697,7 +695,8 @@ func (rf *Raft) tickerAsCandidate() {
 			}
 		}
 	} else {
-		// reset election timer
+		// reset election timer, it is okay to step down here as the election timeout it will be up as a candidate again
+		// with a new term
 		rf.stepDownAsFollower(rf.term)
 	}
 }
@@ -730,7 +729,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.followerTimeout = time.Millisecond * 150 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
+	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
 	rf.applyCh = applyCh
@@ -763,8 +762,6 @@ func (rf *Raft) persist() {
 	e.Encode(rf.term)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	e.Encode(rf.commitIndex)
-	e.Encode(rf.lastApplied)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -783,20 +780,14 @@ func (rf *Raft) readPersist(data []byte) {
 	var term int
 	var votedFor int
 	var log []Entry
-	var commitIndex int
-	var lastApplied int
 	if d.Decode(&term) != nil ||
 		d.Decode(&votedFor) != nil ||
-		d.Decode(&log) != nil ||
-		d.Decode(&commitIndex) != nil ||
-		d.Decode(&lastApplied) != nil {
+		d.Decode(&log) != nil {
 		rf.DPrintf(TopicPersistError, "readPersist failed?!")
 	} else {
 		rf.term = term
 		rf.votedFor = votedFor
 		rf.log = log
-		rf.commitIndex = commitIndex
-		rf.lastApplied = lastApplied
 	}
 }
 
