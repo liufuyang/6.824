@@ -254,10 +254,10 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 				panic("!!! 2 leaders exist at the same time with the same term!!!")
 			}
 		}
-		if args.Term > rf.term {
+		if args.Term > rf.term || rf.votedFor != args.From {
 			rf.stepDownAsFollower(args.Term)
-			rf.votedFor = args.From
-			rf.persist() // at HeartBeat term updates
+			rf.votedFor = args.From // keep votedFor
+			rf.persist()            // at HeartBeat term updates
 		}
 
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -529,6 +529,7 @@ func (rf *Raft) tickerAsLeader() {
 	currentTerm := rf.term
 	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
 	heartBeatCount := 1 // vote for myself
+	termUpdated := false
 	for p, _ := range rf.peers {
 		if p != rf.me {
 			select {
@@ -537,8 +538,7 @@ func (rf *Raft) tickerAsLeader() {
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
 				if reply.Term > currentTerm {
-					rf.stepDownAsFollower(reply.Term)
-					return
+					termUpdated = true
 				}
 				if reply.Good { // Heartbeat/Commit Successful
 					rf.nextIndexes[i] = nextIndexesToBe[i]
@@ -569,6 +569,13 @@ func (rf *Raft) tickerAsLeader() {
 	}
 	rf.mu.Lock()
 
+	// check termUpdated asynchronously, if so just return as follower
+	if termUpdated {
+		votedFor := rf.votedFor
+		rf.stepDownAsFollower(rf.term)
+		rf.votedFor = votedFor // preserveVotedFor
+		return
+	}
 	// check whether this candidate has been set back to Follower
 	if rf.state == Follower {
 		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
@@ -647,7 +654,6 @@ func (rf *Raft) tickerAsCandidate() {
 						return
 					}
 				}
-				fmt.Printf("-----------<<<<<<<<<<<<<<<<< No reply received? --------------\n")
 				c1 <- reply
 			}(other)
 		}
@@ -655,14 +661,13 @@ func (rf *Raft) tickerAsCandidate() {
 	currentTerm := rf.term
 	rf.mu.Unlock()
 	voteCount := 1 // vote for myself
+	termUpdated := false
 	for p, _ := range rf.peers {
 		if p != rf.me {
 			select {
 			case reply := <-c1:
 				if reply.Term > currentTerm {
-					rf.mu.Lock()
-					rf.stepDownAsFollower(reply.Term)
-					return
+					termUpdated = true
 				}
 				if reply.Agree {
 					voteCount = voteCount + 1
@@ -676,7 +681,13 @@ func (rf *Raft) tickerAsCandidate() {
 		}
 	}
 	rf.mu.Lock()
-
+	// check termUpdated asynchronously, if so just return as follower
+	if termUpdated {
+		votedFor := rf.votedFor
+		rf.stepDownAsFollower(rf.term)
+		rf.votedFor = votedFor // preserve VotedFor
+		return
+	}
 	// check whether this candidate has been set back to Follower
 	if rf.state == Follower {
 		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
