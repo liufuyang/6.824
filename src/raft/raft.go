@@ -166,8 +166,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	rf.DPrintf(TopicVR, "args.from:%v, args.Term:%v ", args.From, args.Term)
 
-	rf.tickerContextCancel()
-
 	if args.Term < rf.term {
 		reply.Agree = false
 		reply.Term = rf.term
@@ -183,6 +181,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower (§5.1)
 		if args.Term > rf.term {
+			rf.tickerContextCancel()
 			rf.stepDownAsFollower(args.Term) // also clear up votedFor, as we haven't voted yet seems important
 			rf.persist()                     // at RequestVote term updates
 		}
@@ -228,7 +227,7 @@ type HeartBeatReply struct {
 	Good         bool // true if follower contained entry matching prevLogIndex and prevLogTerm - TODO
 	Term         int
 	From         int
-	LastLogIndex int
+	LastLogIndex int // for speed up finding nextIndex
 	LastLogTerm  int
 }
 
@@ -243,8 +242,6 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	reply.From = rf.me
-
-	rf.tickerContextCancel()
 
 	if args.Term < rf.term {
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 1. Reply false if Term < currentTerm (§5.1)
@@ -261,10 +258,16 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 				panic("!!! 2 leaders exist at the same time with the same term!!!")
 			}
 		}
-		if args.Term > rf.term || rf.votedFor != args.From {
-			rf.stepDownAsFollower(args.Term)
-			rf.votedFor = args.From // keep votedFor
-			rf.persist()            // at HeartBeat term updates
+
+		// Different with RequestVote, here we immediately refresh timeout
+		// as when args.Term >= rf.term then means there is a valid leader exist!
+		// No need to do leader log up-to-date check as if leader has some old log it would not be possible
+		// to be elected as leader in the first place.
+		rf.stepDownAsFollower(args.Term) // refresh election timeout
+		rf.votedFor = args.From          // keep votedFor
+		if args.Term > rf.term {
+			rf.tickerContextCancel()
+			rf.persist() // at HeartBeat term updates
 		}
 
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -452,7 +455,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) ticker() {
 	// Setup tickerContext
 	ctx := context.Background()
-	rf.tickerContext, rf.tickerContextCancel = context.WithTimeout(ctx, rf.remoteCallTimeoutDuration)
+	rf.tickerContext, rf.tickerContextCancel = context.WithCancel(ctx)
 
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
@@ -467,7 +470,7 @@ func (rf *Raft) ticker() {
 
 		// Setup tickerContext
 		ctx := context.Background()
-		rf.tickerContext, rf.tickerContextCancel = context.WithTimeout(ctx, rf.remoteCallTimeoutDuration)
+		rf.tickerContext, rf.tickerContextCancel = context.WithCancel(ctx)
 
 		if rf.state == Leader {
 			rf.mu.Unlock()
@@ -543,6 +546,7 @@ func (rf *Raft) tickerAsLeader() {
 	currentTerm := rf.term
 	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
 	heartBeatCount := 1 // vote for myself
+	replyCount := 1     // count it the same way as heartBeat
 	termUpdated := false
 	for p, _ := range rf.peers {
 		if p != rf.me {
@@ -551,6 +555,10 @@ func (rf *Raft) tickerAsLeader() {
 				i := reply.From
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
+				replyCount = replyCount + 1
+				if replyCount >= len(rf.peers)/2+1 {
+					rf.tickerContextCancel() // cancel context, no need to wait for the rest
+				}
 				if reply.Term > currentTerm {
 					termUpdated = true
 				}
@@ -558,10 +566,6 @@ func (rf *Raft) tickerAsLeader() {
 					rf.nextIndexes[i] = nextIndexesToBe[i]
 					rf.matchIndexes[i] = matchIndexesToBe[i]
 					heartBeatCount = heartBeatCount + 1
-
-					if heartBeatCount >= len(rf.peers)/2+1 {
-						rf.tickerContextCancel()
-					}
 					rf.DPrintf(TopicTickerLeader, "Good -------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
 				} else {
 					rf.DPrintf(TopicTickerLeader, "Bad --------------------------------------rf.nextIndexes[%v]=%v, reply.LastLogIndex=%v\n", i, rf.nextIndexes[i], reply.LastLogIndex)
@@ -764,7 +768,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
-	rf.remoteCallTimeoutDuration = time.Millisecond * 250
+	rf.remoteCallTimeoutDuration = time.Millisecond * 2000
 	rf.applyCh = applyCh
 	rf.nextIndexes = make([]int, len(peers))
 	rf.matchIndexes = make([]int, len(peers))
