@@ -696,7 +696,7 @@ func (rf *Raft) tickerAsCandidate() {
 				if reply.Agree {
 					voteCount = voteCount + 1
 					if voteCount >= len(rf.peers)/2+1 {
-						rf.tickerContextCancel()
+						rf.tickerContextCancel() // tickerCandidate
 					}
 				}
 			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
@@ -793,7 +793,10 @@ func (rf *Raft) tickerContextCancel() {
 		// for passing TestRPCBytes2B
 		// we let the leader ticker wait for a little while after got enough heartbeats so the reset beats
 		// can be received as well so let nextIndex updated, so to avoid sending the beats again
-		time.Sleep(time.Millisecond * 30)
+		// this value cannot be too large as in some cases it may let the leader ticker holding on for too long
+		// and causing other candidate to show up, resulting term increase and the leader might not commit the
+		// last logs from the previous term, if no new entry comes in
+		time.Sleep(time.Millisecond * 50)
 		rf.mu.Lock()
 		rf.tickerContextCancelHandle()
 		rf.mu.Unlock()
@@ -871,8 +874,8 @@ func (rf *Raft) getElectionTimeoutDuration() time.Duration {
 func (rf *Raft) DPrintf(topic logTopic, format string, a ...interface{}) {
 	rfTrace := fmt.Sprintf("Node<%v> [%v]|Term(%v)|VotedFor(%v)|CIndex(%v)|%v",
 		rf.me, rf.state, rf.term, rf.votedFor, rf.commitIndex, rf.log)
-	rfDebug := fmt.Sprintf("Node<%v> [%v]|Term(%v)|VotedFor(%v)|CIndex(%v)|",
-		rf.me, rf.state, rf.term, rf.votedFor, rf.commitIndex)
+	rfDebug := fmt.Sprintf("Node<%v> [%v]|Term(%v)|VotedFor(%v)|CIndex(%v)|logLen(%v)",
+		rf.me, rf.state, rf.term, rf.votedFor, rf.commitIndex, len(rf.log))
 	TPrintf(topic, rfTrace, rfDebug, format, a...)
 }
 
