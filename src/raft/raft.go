@@ -568,7 +568,6 @@ func (rf *Raft) tickerAsLeader() {
 		}
 	}
 	rf.mu.Lock()
-	// TODO: after Lock, check states again
 
 	// check whether this candidate has been set back to Follower
 	if rf.state == Follower {
@@ -699,7 +698,7 @@ func (rf *Raft) tickerAsCandidate() {
 		}
 	} else {
 		// reset election timer
-		rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
+		rf.stepDownAsFollower(rf.term)
 	}
 }
 
