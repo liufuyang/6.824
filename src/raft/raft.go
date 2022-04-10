@@ -83,8 +83,6 @@ type Raft struct {
 	electionTimeoutTime       time.Time
 	heartsBeatDuration        time.Duration
 	remoteCallTimeoutDuration time.Duration
-	tickerContext             context.Context
-	tickerContextCancelHandle context.CancelFunc
 
 	// for 2B - apply commit
 	applyCh chan ApplyMsg
@@ -181,7 +179,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower (§5.1)
 		if args.Term > rf.term {
-			rf.tickerContextCancel()         // RequestVote cancel context as args.Term > rf.term
+			// rf.tickerContextCancel()         // RequestVote cancel context as args.Term > rf.term
 			rf.stepDownAsFollower(args.Term) // also clear up votedFor, as we haven't voted yet seems important
 			rf.persist()                     // at RequestVote term updates
 		}
@@ -266,8 +264,8 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		rf.stepDownAsFollower(args.Term) // refresh election timeout
 		rf.votedFor = args.From          // keep votedFor
 		if args.Term > rf.term {
-			rf.tickerContextCancel() // HeatBeat cancel context as args.Term > rf.term
-			rf.persist()             // at HeartBeat term updates
+			// rf.tickerContextCancel() // HeatBeat cancel context as args.Term > rf.term
+			rf.persist() // at HeartBeat term updates
 		}
 
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -325,16 +323,12 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		if args.LeaderCommit > rf.commitIndex {
 			newCommitIndex := min(args.LeaderCommit, rf.lastLogIndex())
 			if rf.commitIndex != newCommitIndex {
-				startIndex := rf.commitIndex + 1 // start from the new entry after previous committed value
+				// apply logs async
 				rf.commitIndex = newCommitIndex
-				for i, v := range rf.log[startIndex : newCommitIndex+1] {
-					rf.applyCh <- ApplyMsg{
-						CommandValid: true,
-						Command:      v.Command,
-						CommandIndex: startIndex + i,
-					}
-					rf.DPrintf(TopicTickerLeader, "Follower committed new log with index %v\n", startIndex+i)
-				}
+
+				//rf.mu.Unlock()
+				//go rf.sendApplyMsg(fmt.Sprintf("Follower %v", rf.me), newCommitIndex)
+				//rf.mu.Lock()
 			}
 		}
 
@@ -453,9 +447,6 @@ func (rf *Raft) killed() bool {
 // The ticker go routine starts a new election if this peer hasn't received
 // heartsbeats recently.
 func (rf *Raft) ticker() {
-	// Setup tickerContext
-	ctx := context.Background()
-	rf.tickerContext, rf.tickerContextCancelHandle = context.WithCancel(ctx)
 
 	for rf.killed() == false {
 		// Your code here to check if a leader election should
@@ -470,11 +461,12 @@ func (rf *Raft) ticker() {
 
 		// Setup tickerContext
 		ctx := context.Background()
-		rf.tickerContext, rf.tickerContextCancelHandle = context.WithCancel(ctx)
+		tickerContext, tickerContextCancelHandle := context.WithCancel(ctx)
 
 		if rf.state == Leader {
+			rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
 			rf.mu.Unlock()
-			rf.tickerAsLeader()
+			go rf.tickerAsLeader(tickerContext, tickerContextCancelHandle)
 			continue
 		} else if rf.state == Follower {
 			rf.state = Candidate
@@ -484,16 +476,17 @@ func (rf *Raft) ticker() {
 			continue
 		} else if rf.state == Candidate {
 			rf.mu.Unlock()
-			rf.tickerAsCandidate()
+			rf.tickerAsCandidate(tickerContext, tickerContextCancelHandle)
 			continue
 		}
 
 	}
 }
 
-func (rf *Raft) tickerAsLeader() {
+func (rf *Raft) tickerAsLeader(ctx context.Context, ctxCancelFunc context.CancelFunc) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	rf.DPrintf(TopicTickerLeader, "Leader sends heartsbeats to others... \n")
 	c1 := make(chan *HeartBeatReply)
 	// specify some temp values to hold these index while having the lock, as rf.log might get changed (new command arrives) when unlocked below to allow the Call method runnable in goroutines
@@ -525,7 +518,10 @@ func (rf *Raft) tickerAsLeader() {
 			if rf.lastLogIndex() >= rf.nextIndexes[i] {
 				// limit length of entries
 				entryLength := min(128, rf.lastLogIndex()-rf.nextIndexes[i])
-				args.Entries = rf.log[rf.nextIndexes[i] : rf.nextIndexes[i]+entryLength+1]
+				// try avoid data-race at runtime.slicecopy()
+				entryCopy := make([]Entry, entryLength+1)
+				copy(entryCopy, rf.log[rf.nextIndexes[i]:rf.nextIndexes[i]+entryLength+1])
+				args.Entries = entryCopy
 				nextIndexesToBe[i] = rf.nextIndexes[i] + entryLength + 1
 				matchIndexesToBe[i] = rf.nextIndexes[i] + entryLength // TODO - is this what to specific for matchIndexesToBe?
 			}
@@ -559,7 +555,7 @@ func (rf *Raft) tickerAsLeader() {
 				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
 				replyCount = replyCount + 1
 				if replyCount >= len(rf.peers)/2+1 {
-					rf.tickerContextCancel() // tickerAsLeader cancel context, no need to wait for the rest
+					tickerContextCancel(ctxCancelFunc, time.Millisecond*2000) // tickerAsLeader cancel context, no need to wait for the rest
 				}
 				if reply.Term > currentTerm {
 					termUpdated = true
@@ -583,10 +579,14 @@ func (rf *Raft) tickerAsLeader() {
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 				rf.mu.Unlock()
-			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
-			case <-rf.tickerContext.Done(): // time.After(rf.remoteCallTimeoutDuration):
+			//case <-time.After(time.Millisecond * 1000):
+			//	rf.mu.Lock()
+			//	rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout by time.After, giving up calling\n")
+			//	rf.mu.Unlock()
+			//// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
+			case <-ctx.Done(): // time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
-				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
+				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout by rf.tickerContext.Done(), giving up calling\n")
 				rf.mu.Unlock()
 			}
 		}
@@ -598,6 +598,7 @@ func (rf *Raft) tickerAsLeader() {
 		votedFor := rf.votedFor
 		rf.stepDownAsFollower(rf.term)
 		rf.votedFor = votedFor // preserveVotedFor
+		rf.persist()
 		return
 	}
 	// check whether this candidate has been set back to Follower
@@ -635,22 +636,40 @@ func (rf *Raft) tickerAsLeader() {
 			}
 		}
 		if validNExist {
-			for i := rf.commitIndex + 1; i <= N; i++ {
-				// Leader commit
-				rf.commitIndex = i
-				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[i].Command,
-					CommandIndex: i,
-				}
-				rf.DPrintf(TopicTickerLeader, "Leader committed new log\n")
-			}
+			rf.commitIndex = N
+			//rf.mu.Unlock()
+			//rf.sendApplyMsg("Leader", rf.commitIndex+1, N)
+			//rf.mu.Lock()
 		}
 	}
-	rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
 }
 
-func (rf *Raft) tickerAsCandidate() {
+func (rf *Raft) sendApplyMsg() {
+	for {
+		time.Sleep(time.Millisecond * 10)
+		rf.mu.Lock()
+		toIndex := rf.commitIndex
+		rf.mu.Unlock()
+
+		for i := rf.lastApplied + 1; i <= toIndex; i++ {
+			// Leader commit
+			rf.mu.Lock()
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			}
+			rf.DPrintf(TopicTickerLeader, "%v[%v] committed new log on index[%v]\n", rf.state, rf.me, i)
+			rf.lastApplied = i
+			rf.mu.Unlock()
+
+			rf.applyCh <- msg
+		}
+	}
+
+}
+
+func (rf *Raft) tickerAsCandidate(ctx context.Context, ctxCancelFunc context.CancelFunc) {
 	//  A candidate continues in this state until one of three things happens:
 	//  (a) it wins the election,
 	//  (b) another server establishes itself as leader, or
@@ -696,11 +715,11 @@ func (rf *Raft) tickerAsCandidate() {
 				if reply.Agree {
 					voteCount = voteCount + 1
 					if voteCount >= len(rf.peers)/2+1 {
-						rf.tickerContextCancel() // tickerCandidate
+						tickerContextCancel(ctxCancelFunc, time.Millisecond*10) // tickerCandidate
 					}
 				}
 			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
-			case <-rf.tickerContext.Done(): // time.After(rf.remoteCallTimeoutDuration):
+			case <-ctx.Done(): // time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerCandidate, "Candidate call for vote to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
@@ -713,6 +732,7 @@ func (rf *Raft) tickerAsCandidate() {
 		votedFor := rf.votedFor
 		rf.stepDownAsFollower(rf.term)
 		rf.votedFor = votedFor // preserve VotedFor
+		rf.persist()
 		return
 	}
 	// check whether this candidate has been set back to Follower
@@ -769,7 +789,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
-	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
+	rf.heartsBeatDuration = time.Millisecond * 150 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
 	rf.remoteCallTimeoutDuration = time.Millisecond * 2000
 	rf.applyCh = applyCh
 	rf.nextIndexes = make([]int, len(peers))
@@ -785,10 +805,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	// start goroutine to apply messages
+	go rf.sendApplyMsg()
+
 	return rf
 }
 
-func (rf *Raft) tickerContextCancel() {
+func tickerContextCancel(cancelFunc context.CancelFunc, waitDuration time.Duration) {
 	go func() {
 		// for passing TestRPCBytes2B
 		// we let the leader ticker wait for a little while after got enough heartbeats so the reset beats
@@ -796,10 +819,8 @@ func (rf *Raft) tickerContextCancel() {
 		// this value cannot be too large as in some cases it may let the leader ticker holding on for too long
 		// and causing other candidate to show up, resulting term increase and the leader might not commit the
 		// last logs from the previous term, if no new entry comes in
-		time.Sleep(time.Millisecond * 50)
-		rf.mu.Lock()
-		rf.tickerContextCancelHandle()
-		rf.mu.Unlock()
+		time.Sleep(waitDuration)
+		cancelFunc()
 	}()
 }
 
@@ -811,8 +832,14 @@ func (rf *Raft) tickerContextCancel() {
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
+
+	if rf.state == Candidate {
+		panic("########################## Persist with Candidate state...?")
+	}
+
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
+	e.Encode(rf.me)
 	e.Encode(rf.term)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
@@ -831,14 +858,17 @@ func (rf *Raft) readPersist(data []byte) {
 	// Example:
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
+	var me int
 	var term int
 	var votedFor int
 	var log []Entry
-	if d.Decode(&term) != nil ||
+	if d.Decode(&me) != nil ||
+		d.Decode(&term) != nil ||
 		d.Decode(&votedFor) != nil ||
 		d.Decode(&log) != nil {
 		rf.DPrintf(TopicPersistError, "readPersist failed?!")
 	} else {
+		rf.me = me
 		rf.term = term
 		rf.votedFor = votedFor
 		rf.log = log

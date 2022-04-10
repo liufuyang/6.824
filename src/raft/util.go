@@ -81,7 +81,7 @@ func TPrintf(topic logTopic, traceStr string, debugStr string, format string, a 
 	if debugVerbosity == trace {
 		prefix = fmt.Sprintf("%03d|%03dMS [%v] |%v| - ", time1000MS, timeMS, topic, traceStr)
 	} else if debugVerbosity == debug {
-		prefix = fmt.Sprintf("%06d [%v] %v - ", time, topic, debugStr)
+		prefix = fmt.Sprintf("%03d|%03dMS [%v] %v - ", time1000MS, timeMS, topic, debugStr)
 	}
 
 	format = prefix + format
