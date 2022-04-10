@@ -179,7 +179,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower (§5.1)
 		if args.Term > rf.term {
-			// rf.tickerContextCancel()         // RequestVote cancel context as args.Term > rf.term
 			rf.stepDownAsFollower(args.Term) // also clear up votedFor, as we haven't voted yet seems important
 			rf.persist()                     // at RequestVote term updates
 		}
@@ -253,7 +252,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
 			if rf.term == args.Term {
 				rf.DPrintf(TopicHB, "!!!!!!! *** THIS SHOULD RARELY HAPPEN *** !!!!!!! 2 leaders exist at the same time with the same term. Only happens when no log difference on all nodes.\n")
-				panic("!!! 2 leaders exist at the same time with the same term!!!")
+				// panic("!!! 2 leaders exist at the same time with the same term!!!")
 			}
 		}
 
@@ -261,9 +260,10 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		// as when args.Term >= rf.term then means there is a valid leader exist!
 		// No need to do leader log up-to-date check as if leader has some old log it would not be possible
 		// to be elected as leader in the first place.
+		oldTerm := rf.term
 		rf.stepDownAsFollower(args.Term) // refresh election timeout
 		rf.votedFor = args.From          // keep votedFor
-		if args.Term > rf.term {
+		if args.Term > oldTerm {
 			// rf.tickerContextCancel() // HeatBeat cancel context as args.Term > rf.term
 			rf.persist() // at HeartBeat term updates
 		}
@@ -459,14 +459,11 @@ func (rf *Raft) ticker() {
 			continue
 		}
 
-		// Setup tickerContext
-		ctx := context.Background()
-		tickerContext, tickerContextCancelHandle := context.WithCancel(ctx)
-
 		if rf.state == Leader {
 			rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
+			term := rf.term
 			rf.mu.Unlock()
-			go rf.tickerAsLeader(tickerContext, tickerContextCancelHandle)
+			go rf.tickerAsLeader(term)
 			continue
 		} else if rf.state == Follower {
 			rf.state = Candidate
@@ -476,16 +473,36 @@ func (rf *Raft) ticker() {
 			continue
 		} else if rf.state == Candidate {
 			rf.mu.Unlock()
-			rf.tickerAsCandidate(tickerContext, tickerContextCancelHandle)
+			rf.tickerAsCandidate()
 			continue
 		}
 
 	}
 }
 
-func (rf *Raft) tickerAsLeader(ctx context.Context, ctxCancelFunc context.CancelFunc) {
+func (rf *Raft) tickerAsLeader(currentTerm int) {
+	// Setup tickerContext
+	ctx := context.Background()
+	ctx, _ = context.WithTimeout(ctx, time.Millisecond*2000)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// QUESTION - adding this part should avoid 2 leaders exist at the same time, but it fails TestFollowerFailure2B???
+	// check term updated asynchronously, if so just return as follower
+	//if rf.term != currentTerm {
+	//	votedFor := rf.votedFor
+	//	rf.stepDownAsFollower(rf.term)
+	//	rf.votedFor = votedFor // preserveVotedFor
+	//	rf.persist()
+	//	return
+	//}
+	//// check whether this candidate has been set back to Follower
+	//if rf.state == Follower {
+	//	rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
+	//	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+	//	return
+	//}
 
 	rf.DPrintf(TopicTickerLeader, "Leader sends heartsbeats to others... \n")
 	c1 := make(chan *HeartBeatReply)
@@ -518,7 +535,7 @@ func (rf *Raft) tickerAsLeader(ctx context.Context, ctxCancelFunc context.Cancel
 			if rf.lastLogIndex() >= rf.nextIndexes[i] {
 				// limit length of entries
 				entryLength := min(128, rf.lastLogIndex()-rf.nextIndexes[i])
-				// try avoid data-race at runtime.slicecopy()
+				// PITFALL? - try avoid data-race at runtime.slicecopy()
 				entryCopy := make([]Entry, entryLength+1)
 				copy(entryCopy, rf.log[rf.nextIndexes[i]:rf.nextIndexes[i]+entryLength+1])
 				args.Entries = entryCopy
@@ -541,7 +558,7 @@ func (rf *Raft) tickerAsLeader(ctx context.Context, ctxCancelFunc context.Cancel
 			}(i, other)
 		}
 	}
-	currentTerm := rf.term
+
 	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
 	heartBeatCount := 1 // vote for myself
 	replyCount := 1     // count it the same way as heartBeat
@@ -554,9 +571,10 @@ func (rf *Raft) tickerAsLeader(ctx context.Context, ctxCancelFunc context.Cancel
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
 				replyCount = replyCount + 1
-				if replyCount >= len(rf.peers)/2+1 {
-					tickerContextCancel(ctxCancelFunc, time.Millisecond*2000) // tickerAsLeader cancel context, no need to wait for the rest
-				}
+				// For passing critical tests, we wait as long as possible
+				//if replyCount >= len(rf.peers)/2+1 {
+				//	ctxCancelFunc()
+				//}
 				if reply.Term > currentTerm {
 					termUpdated = true
 				}
@@ -579,10 +597,6 @@ func (rf *Raft) tickerAsLeader(ctx context.Context, ctxCancelFunc context.Cancel
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
 				rf.mu.Unlock()
-			//case <-time.After(time.Millisecond * 1000):
-			//	rf.mu.Lock()
-			//	rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout by time.After, giving up calling\n")
-			//	rf.mu.Unlock()
 			//// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
 			case <-ctx.Done(): // time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
@@ -669,11 +683,15 @@ func (rf *Raft) sendApplyMsg() {
 
 }
 
-func (rf *Raft) tickerAsCandidate(ctx context.Context, ctxCancelFunc context.CancelFunc) {
+func (rf *Raft) tickerAsCandidate() {
 	//  A candidate continues in this state until one of three things happens:
 	//  (a) it wins the election,
 	//  (b) another server establishes itself as leader, or
 	//  (c) a period of time goes by with no winner
+
+	// Setup tickerContext
+	ctx := context.Background()
+	ctx, ctxCancelFunc := context.WithTimeout(ctx, time.Millisecond*2000)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -715,7 +733,7 @@ func (rf *Raft) tickerAsCandidate(ctx context.Context, ctxCancelFunc context.Can
 				if reply.Agree {
 					voteCount = voteCount + 1
 					if voteCount >= len(rf.peers)/2+1 {
-						tickerContextCancel(ctxCancelFunc, time.Millisecond*10) // tickerCandidate
+						ctxCancelFunc()
 					}
 				}
 			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
@@ -789,7 +807,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
-	rf.heartsBeatDuration = time.Millisecond * 150 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
+	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
 	rf.remoteCallTimeoutDuration = time.Millisecond * 2000
 	rf.applyCh = applyCh
 	rf.nextIndexes = make([]int, len(peers))
@@ -809,19 +827,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	go rf.sendApplyMsg()
 
 	return rf
-}
-
-func tickerContextCancel(cancelFunc context.CancelFunc, waitDuration time.Duration) {
-	go func() {
-		// for passing TestRPCBytes2B
-		// we let the leader ticker wait for a little while after got enough heartbeats so the reset beats
-		// can be received as well so let nextIndex updated, so to avoid sending the beats again
-		// this value cannot be too large as in some cases it may let the leader ticker holding on for too long
-		// and causing other candidate to show up, resulting term increase and the leader might not commit the
-		// last logs from the previous term, if no new entry comes in
-		time.Sleep(waitDuration)
-		cancelFunc()
-	}()
 }
 
 //
