@@ -252,7 +252,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
 			if rf.term == args.Term {
 				rf.DPrintf(TopicHB, "!!!!!!! *** THIS SHOULD RARELY HAPPEN *** !!!!!!! 2 leaders exist at the same time with the same term. Only happens when no log difference on all nodes.\n")
-				// panic("!!! 2 leaders exist at the same time with the same term!!!")
+				panic("!!! 2 leaders exist at the same time with the same term!!!")
 			}
 		}
 
@@ -558,10 +558,11 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 			}(i, other)
 		}
 	}
+	lastLogIndexForThisBeat := rf.lastLogIndex()
 
 	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
-	heartBeatCount := 1 // vote for myself
-	replyCount := 1     // count it the same way as heartBeat
+	heartBeatCount := 1 // Vote for myself
+	replyCount := 1     // Count it the same way as heartBeat
 	termUpdated := false
 	for p, _ := range rf.peers {
 		if p != rf.me {
@@ -571,16 +572,19 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 				rf.mu.Lock()
 				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
 				replyCount = replyCount + 1
-				// For passing critical tests, we wait as long as possible
+				// For passing critical tests, we wait as long as possible,
+				// So comment out ctx cancellation here, otherwise in production system it perhaps better to have this
 				//if replyCount >= len(rf.peers)/2+1 {
 				//	ctxCancelFunc()
 				//}
 				if reply.Term > currentTerm {
 					termUpdated = true
 				}
-				if reply.Good { // Heartbeat/Commit Successful
-					rf.nextIndexes[i] = nextIndexesToBe[i]
-					rf.matchIndexes[i] = matchIndexesToBe[i]
+				if reply.Good {
+					// Heartbeat/Commit Successful
+					// Only increase those indexes as some old Heartbeat might return slowly or after a newer beat comes back first
+					rf.nextIndexes[i] = max(nextIndexesToBe[i], rf.nextIndexes[i])
+					rf.matchIndexes[i] = max(matchIndexesToBe[i], rf.matchIndexes[i])
 					heartBeatCount = heartBeatCount + 1
 					rf.DPrintf(TopicTickerLeader, "Good -------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
 				} else {
@@ -596,6 +600,10 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 					}
 					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
 				}
+				// increase rf.commitIndex as soon as possible in case of some follower is offline for return very slow
+				if heartBeatCount >= len(rf.peers)/2+1 {
+					rf.checkAndUpdateCommitIndex(termUpdated, currentTerm, lastLogIndexForThisBeat)
+				}
 				rf.mu.Unlock()
 			//// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
 			case <-ctx.Done(): // time.After(rf.remoteCallTimeoutDuration):
@@ -606,8 +614,11 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 		}
 	}
 	rf.mu.Lock()
+}
 
-	// check termUpdated asynchronously, if so just return as follower
+// lastLogIndexForThisBeat is used here to prevent rf.log updated between each heart beat goroutine
+func (rf *Raft) checkAndUpdateCommitIndex(termUpdated bool, currentTerm int, lastLogIndexForThisBeat int) {
+	////check termUpdated asynchronously, if so just return as follower
 	if termUpdated {
 		votedFor := rf.votedFor
 		rf.stepDownAsFollower(rf.term)
@@ -622,40 +633,35 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 		return
 	}
 
-	if heartBeatCount >= len(rf.peers)/2+1 {
-		// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
-		// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
-		// We have to use a `validNExist` to firstly find a valid N then do the commit because there could be
-		// a special case that some uncommitted logs has a lower term should not be committed if there does not exist
-		// an uncommitted log with current term and also replicated. see https://youtu.be/YbZ3zDzDnrw?t=2136
-		// For example:
-		// If term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1}], then {106 1} should not be committed
-		// Then later if term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1} {106 3}], then {106 1} and {106 3} should both be committed when {106 3} is replicated
-		N := rf.commitIndex + 1
-		validNExist := false
-		for ; N <= rf.lastLogIndex(); N = N + 1 { // make it more efficient, jump more with N
-			numberOfMatchIndexLEtoN := 1
-			for i, _ := range rf.peers {
-				if i != rf.me && rf.matchIndexes[i] >= N {
-					numberOfMatchIndexLEtoN = numberOfMatchIndexLEtoN + 1
-				}
-			}
-			if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 {
-				if rf.log[N].Term == currentTerm {
-					validNExist = true
-					break
-				}
-			} else {
-				break
+	// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
+	// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
+	// We have to use a `validNExist` to firstly find a valid N then do the commit because there could be
+	// a special case that some uncommitted logs has a lower term should not be committed if there does not exist
+	// an uncommitted log with current term and also replicated. see https://youtu.be/YbZ3zDzDnrw?t=2136
+	// For example:
+	// If term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1}], then {106 1} should not be committed
+	// Then later if term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1} {106 3}], then {106 1} and {106 3} should both be committed when {106 3} is replicated
+	N := rf.commitIndex + 1
+	//validNExist := false
+	for ; N <= rf.lastLogIndex(); N = N + 1 { // make it more efficient, jump more with N
+		numberOfMatchIndexLEtoN := 1
+		for i, _ := range rf.peers {
+			if i != rf.me && rf.matchIndexes[i] >= N {
+				numberOfMatchIndexLEtoN = numberOfMatchIndexLEtoN + 1
 			}
 		}
-		if validNExist {
-			rf.commitIndex = N
-			//rf.mu.Unlock()
-			//rf.sendApplyMsg("Leader", rf.commitIndex+1, N)
-			//rf.mu.Lock()
+		if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 {
+			if rf.log[N].Term == currentTerm {
+				//validNExist = true
+				rf.commitIndex = N
+			}
+		} else {
+			break
 		}
 	}
+	//if validNExist {
+	//	rf.commitIndex = N
+	//}
 }
 
 func (rf *Raft) sendApplyMsg() {
@@ -722,14 +728,12 @@ func (rf *Raft) tickerAsCandidate() {
 	currentTerm := rf.term
 	rf.mu.Unlock()
 	voteCount := 1 // vote for myself
-	termUpdated := false
+	replyMaxTerm := 0
 	for p, _ := range rf.peers {
 		if p != rf.me {
 			select {
 			case reply := <-c1:
-				if reply.Term > currentTerm {
-					termUpdated = true
-				}
+				replyMaxTerm = max(replyMaxTerm, reply.Term)
 				if reply.Agree {
 					voteCount = voteCount + 1
 					if voteCount >= len(rf.peers)/2+1 {
@@ -746,9 +750,9 @@ func (rf *Raft) tickerAsCandidate() {
 	}
 	rf.mu.Lock()
 	// check termUpdated asynchronously, if so just return as follower
-	if termUpdated {
+	if replyMaxTerm > currentTerm {
 		votedFor := rf.votedFor
-		rf.stepDownAsFollower(rf.term)
+		rf.stepDownAsFollower(replyMaxTerm)
 		rf.votedFor = votedFor // preserve VotedFor
 		rf.persist()
 		return
@@ -779,8 +783,8 @@ func (rf *Raft) tickerAsCandidate() {
 
 func (rf *Raft) stepDownAsFollower(term int) {
 	rf.state = Follower
-	rf.term = term
-	rf.votedFor = -1 // IMPORTANT - need to clean votedFor when step down
+	rf.term = max(rf.term, term) // IMPORTANT
+	rf.votedFor = -1             // IMPORTANT - need to clean votedFor when step down
 	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 }
 
