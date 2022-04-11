@@ -31,6 +31,7 @@ const (
 	TopicStart           logTopic = "Start/Req  "
 	TopicPersist         logTopic = "Persist    "
 	TopicPersistError    logTopic = "PersistErr "
+	TopicAsyncCommit     logTopic = "AsyncCommit"
 )
 
 type logLevel int

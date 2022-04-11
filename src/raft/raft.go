@@ -295,6 +295,15 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 				if i < len(args.Entries) && v.Term != args.Entries[i].Term {
 					rf.log = rf.log[:args.PrevLogIndex+1+i] // here use Index Not Term!...
 					rf.persist()                            // at HeartBeat log updates
+					// SUBTLE BUG PLACE: when cutting rf.log, rf.nextIndexes[x] needs to be cut as well.
+					// This is not really needed for now as when this cut happens the node is already a follower
+					// Then rf.nextIndexes should not be used anymore and it always get updated when it steps up as a leader
+					//for i, _ := range rf.peers {
+					//	if rf.me != i {
+					//		rf.nextIndexes[i] = min(rf.nextIndexes[i], rf.lastLogIndex()+1)
+					//	}
+					//}
+
 					break
 				}
 			}
@@ -325,10 +334,6 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			if rf.commitIndex != newCommitIndex {
 				// apply logs async
 				rf.commitIndex = newCommitIndex
-
-				//rf.mu.Unlock()
-				//go rf.sendApplyMsg(fmt.Sprintf("Follower %v", rf.me), newCommitIndex)
-				//rf.mu.Lock()
 			}
 		}
 
@@ -480,6 +485,7 @@ func (rf *Raft) ticker() {
 	}
 }
 
+// This method is expected to run async
 func (rf *Raft) tickerAsLeader(currentTerm int) {
 	// Setup tickerContext
 	ctx := context.Background()
@@ -490,19 +496,21 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 
 	// QUESTION - adding this part should avoid 2 leaders exist at the same time, but it fails TestFollowerFailure2B???
 	// check term updated asynchronously, if so just return as follower
-	//if rf.term != currentTerm {
-	//	votedFor := rf.votedFor
-	//	rf.stepDownAsFollower(rf.term)
-	//	rf.votedFor = votedFor // preserveVotedFor
-	//	rf.persist()
-	//	return
-	//}
-	//// check whether this candidate has been set back to Follower
-	//if rf.state == Follower {
-	//	rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
-	//	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-	//	return
-	//}
+	// This solves some subtle bug such as 2 leader with the same term exist and ping each other or
+	// index range issue as rf is step down as follower, rf.log gets cut, but rf.nextIndexes not changed, letting rf.log[rf.nextIndexes[i]-1] below out of range
+	if rf.term != currentTerm {
+		votedFor := rf.votedFor
+		rf.stepDownAsFollower(rf.term)
+		rf.votedFor = votedFor // preserveVotedFor
+		rf.persist()
+		return
+	}
+	// check whether this candidate has been set back to Follower
+	if rf.state == Follower {
+		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		return
+	}
 
 	rf.DPrintf(TopicTickerLeader, "Leader sends heartsbeats to others... \n")
 	c1 := make(chan *HeartBeatReply)
@@ -516,9 +524,9 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 		if i != rf.me {
 			var args *HeartBeatRequest = &HeartBeatRequest{
 				From:         rf.me,
-				Term:         rf.term,
+				Term:         currentTerm, // Could be a SUBTLE BUG if rf.term is used, as tickerAsLeader runs async, when we reach here the rf state might already be changed,
 				PrevLogIndex: rf.nextIndexes[i] - 1,
-				PrevLogTerm:  rf.log[rf.nextIndexes[i]-1].Term,
+				PrevLogTerm:  rf.log[rf.nextIndexes[i]-1].Term, // SUBTLE BUG - as this runs async, rf.log could be cut and
 			}
 			var reply *HeartBeatReply = &HeartBeatReply{}
 
@@ -545,7 +553,8 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 			args.LeaderCommit = rf.commitIndex
 
 			go func(target int, peer *labrpc.ClientEnd) {
-				if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
+				ok := peer.Call("Raft.HeartBeat", args, reply)
+				if ok {
 					if reply.Good {
 						c1 <- reply
 						return
@@ -666,7 +675,7 @@ func (rf *Raft) checkAndUpdateCommitIndex(termUpdated bool, currentTerm int, las
 
 func (rf *Raft) sendApplyMsg() {
 	for {
-		time.Sleep(time.Millisecond * 10)
+		time.Sleep(time.Millisecond * 100)
 		rf.mu.Lock()
 		toIndex := rf.commitIndex
 		rf.mu.Unlock()
@@ -679,7 +688,7 @@ func (rf *Raft) sendApplyMsg() {
 				Command:      rf.log[i].Command,
 				CommandIndex: i,
 			}
-			rf.DPrintf(TopicTickerLeader, "%v[%v] committed new log on index[%v]\n", rf.state, rf.me, i)
+			rf.DPrintf(TopicAsyncCommit, "%v[%v] committed new log on index[%v]\n", rf.state, rf.me, i)
 			rf.lastApplied = i
 			rf.mu.Unlock()
 
@@ -770,7 +779,7 @@ func (rf *Raft) tickerAsCandidate() {
 		rf.state = Leader
 		for i, _ := range rf.peers {
 			if i != rf.me {
-				rf.nextIndexes[i] = rf.commitIndex + 1
+				rf.nextIndexes[i] = rf.lastLogIndex() + 1
 				rf.matchIndexes[i] = 0
 			}
 		}
