@@ -336,6 +336,10 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 				//               [3, 4,] ------------------------------> len(args.Entries)=2
 				//         diff := rf.lastLogIndex() - args.PrevLogIndex = (7-2) = 5 > 2 will cause issue
 				// So if after the above "cutting" step results this happens, we just do nothing as the logs has all the same element already.
+				// Here could introduce a subtle bug as in the above example entry [5, 6] might be some old term in valid entry which will be cleaned later
+				// And here we do nothing, but rf.commitIndex could be updated to the very end and could cusing
+				// So we do this `newCommitIndex := min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))` below
+				// instead of `newCommitIndex := min(args.LeaderCommit, rf.lastLogIndex())`, otherwise, TestFigure8Unreliable2C will give commits aligned error under critical conditions
 			} else {
 				if diff > 0 {
 					fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa entries has some duplicates append, diff:%v log len:%v\n", diff, len(args.Entries[diff:]))
@@ -347,10 +351,11 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 5.  If LeaderCommit > commitIndex, set commitIndex = min(LeaderCommit, index of last new entry)
 		// Follower commit
 		if args.LeaderCommit > rf.commitIndex {
-			newCommitIndex := min(args.LeaderCommit, rf.lastLogIndex())
+			// IMPORTANT - SUBTLE - To allow TestFigure8Unreliable2C give no commit order issue, need to use args.PrevLogIndex+len(args.Entries), see comments above.
+			newCommitIndex := min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 			if rf.commitIndex != newCommitIndex {
 				// apply logs async
-				rf.commitIndex = newCommitIndex
+				rf.commitIndex = newCommitIndex // follower update rf.commitIndex
 			}
 		}
 
@@ -567,14 +572,14 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 			//                  ---- so args.Entries = rf.log[3, 3+1]
 			rf.DPrintf(TopicTickerLeader, "Leader state before sending ------------ rf.lastLogIndex():%v rf.nextIndexes[%v]:%v \n", rf.lastLogIndex(), i, rf.nextIndexes[i])
 			if rf.lastLogIndex() >= rf.nextIndexes[i] {
-				// limit length of entries
-				entryLength := min(128, rf.lastLogIndex()-rf.nextIndexes[i])
-				// PITFALL? - try avoid data-race at runtime.slicecopy()
+				// limit length of entries, for TestFigure8Unreliable2C to pass, have to use a large value otherwise test run too slow to align an input.
+				entryLength := min(500, rf.lastLogIndex()-rf.nextIndexes[i])
+				// PITFALL - we use a copy to try to avoid data-race at runtime.slicecopy(), so the rf.peer[x].Call() method's input don't have to touch anything related to rf
 				entryCopy := make([]Entry, entryLength+1)
 				copy(entryCopy, rf.log[rf.nextIndexes[i]:rf.nextIndexes[i]+entryLength+1])
 				args.Entries = entryCopy
 				nextIndexesToBe[i] = rf.nextIndexes[i] + entryLength + 1
-				matchIndexesToBe[i] = rf.nextIndexes[i] + entryLength // TODO - is this what to specific for matchIndexesToBe?
+				matchIndexesToBe[i] = rf.nextIndexes[i] + entryLength // This should be what to specific for matchIndexesToBe
 			}
 			args.LeaderCommit = rf.commitIndex
 
@@ -630,7 +635,7 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 					for ; newNextI > 1 && rf.log[newNextI].Term > reply.LastLogTerm; newNextI-- {
 					}
 					rf.nextIndexes[i] = max(1, newNextI)                             // speed up
-					rf.nextIndexes[i] = max(rf.nextIndexes[i], rf.matchIndexes[i]+1) // Important, as leader ticker is async, do not reduce nextIndexes if matchIndexes already updated!
+					rf.nextIndexes[i] = max(rf.nextIndexes[i], rf.matchIndexes[i]+1) // IMPORTANT - SUBTLE BUG - as leader ticker is async, do not reduce nextIndexes if matchIndexes already updated! Otherwise, seeing nextIndexes jumps back and forth
 					if d := old - rf.nextIndexes[i]; d > 0 {
 						fmt.Printf("----------------------- speed up ---------------- nextIndexes old-new :%v\n", d)
 					}
@@ -663,7 +668,6 @@ func (rf *Raft) checkAndUpdateCommitIndex(currentTerm int) {
 	// If term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1}], then {106 1} should not be committed
 	// Then later if term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1} {106 3}], then {106 1} and {106 3} should both be committed when {106 3} is replicated
 	N := rf.commitIndex + 1
-	//validNExist := false
 	for ; N <= rf.lastLogIndex(); N = N + 1 { // make it more efficient, jump more with N
 		numberOfMatchIndexLEtoN := 1
 		for i, _ := range rf.peers {
@@ -673,16 +677,12 @@ func (rf *Raft) checkAndUpdateCommitIndex(currentTerm int) {
 		}
 		if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 {
 			if rf.log[N].Term == currentTerm {
-				//validNExist = true
 				rf.commitIndex = N
 			}
 		} else {
 			break
 		}
 	}
-	//if validNExist {
-	//	rf.commitIndex = N
-	//}
 }
 
 func (rf *Raft) sendApplyMsg() {
