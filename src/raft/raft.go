@@ -690,7 +690,6 @@ func (rf *Raft) sendApplyMsg() {
 		rf.mu.Unlock()
 
 		for i := rf.lastApplied + 1; i <= toIndex; i++ {
-			// Leader commit
 			rf.mu.Lock()
 			msg := ApplyMsg{
 				CommandValid: true,
