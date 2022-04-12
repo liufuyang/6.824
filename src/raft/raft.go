@@ -23,6 +23,9 @@ package raft
 //
 
 import (
+	"6.824/labgob"
+	"bytes"
+	"context"
 	"fmt"
 	"math/rand"
 	//	"bytes"
@@ -72,14 +75,14 @@ type Raft struct {
 	// state a Raft server must maintain.
 
 	// for leader election
-	term                  int // Persistent state on all servers: (Updated on stable storage before responding to RPCs)
-	votedFor              int // candidateId that received vote in current term (or null if none) Persistent state on all servers: (Updated on stable storage before responding to RPCs)
-	state                 ServerState
-	followerTimeout       time.Duration
-	rand                  *rand.Rand
-	electionTimeoutTime   time.Time
-	heartsBeatDuration    time.Duration
-	candidateStartingTime time.Time
+	term                      int // Persistent state on all servers: (Updated on stable storage before responding to RPCs)
+	votedFor                  int // candidateId that received vote in current term (or null if none) Persistent state on all servers: (Updated on stable storage before responding to RPCs)
+	state                     ServerState
+	followerTimeout           time.Duration
+	rand                      *rand.Rand
+	electionTimeoutTime       time.Time
+	heartsBeatDuration        time.Duration
+	remoteCallTimeoutDuration time.Duration
 
 	// for 2B - apply commit
 	applyCh chan ApplyMsg
@@ -131,64 +134,6 @@ func (rf *Raft) GetState() (int, bool) {
 }
 
 //
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-//
-func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
-}
-
-//
-// restore previously persisted state.
-//
-func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
-}
-
-//
-// A service wants to switch to snapshot.  Only do so if Raft hasn't
-// have more recent info since it communicate the snapshot on applyCh.
-//
-func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
-
-	// Your code here (2D).
-
-	return true
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
-
-}
-
-//
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
@@ -224,10 +169,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.term
 		return
 	} else { // args.Term >= rf.term
+
+		// Leader or Candidate do not vote for others
+		if args.Term == rf.term && rf.state != Follower {
+			reply.Agree = false
+			reply.Term = rf.term
+			return
+		}
 		// [PAPER] Rules for Servers - All servers: 2. If RPC request or response contains term T > currentTerm:
 		//set currentTerm = T, convert to follower (§5.1)
-		rf.stepDownAsFollower(args.Term)
-		rf.votedFor = args.From
+		if args.Term > rf.term {
+			rf.stepDownAsFollower(args.Term) // also clear up votedFor, as we haven't voted yet seems important
+			rf.persist()                     // at RequestVote term updates
+		}
 
 		// must be a follower here
 		if rf.state != Follower {
@@ -250,9 +204,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		if notYetVoted || votedTheSameBefore {
 			rf.stepDownAsFollower(args.Term) // reset election timeout so if a follower is not
 			rf.votedFor = args.From          // make sure this is set again after the step above
-			rf.term = args.Term
 			reply.Agree = true
 			reply.Term = rf.term
+			rf.persist() // at RequestVote term and votedFor updates
 			rf.DPrintf(TopicVR, "Vote True for %v", args.From)
 		}
 	}
@@ -267,10 +221,10 @@ type HeartBeatRequest struct {
 	LeaderCommit int     // leader’s commitIndex
 }
 type HeartBeatReply struct {
-	Good         bool // true if follower contained entry matching prevLogIndex and prevLogTerm - TODO
+	Good         bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 	Term         int
 	From         int
-	LastLogIndex int
+	LastLogIndex int // for speed up finding nextIndex
 	LastLogTerm  int
 }
 
@@ -286,18 +240,32 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 	defer rf.mu.Unlock()
 	reply.From = rf.me
 
-	if args.Term >= rf.term {
+	if args.Term < rf.term {
+		// [PAPER] AppendEntries-RPC - Receiver implementation: 1. Reply false if Term < currentTerm (§5.1)
+		// allow election timeout later when receiving AppendEntries RPC from low Term calls
+		reply.Good = false
+		reply.Term = rf.term
+		rf.DPrintf(TopicHB, "args.From:%v, args.Term:%v --- Ignored\n", args.From, args.Term)
+		return // ignore
+	} else { // args.Term >= rf.term
 		if rf.state == Leader {
 			rf.DPrintf(TopicHB, "!!!!!!! THIS SHOULD RARELY HAPPEN? !!!!!!! 2 leaders exist at the same time? rf.me: %v, rf.term: %v,  args.From: %v, args.Term: %v\n", rf.me, rf.term, args.From, args.Term)
 			if rf.term == args.Term {
 				rf.DPrintf(TopicHB, "!!!!!!! *** THIS SHOULD RARELY HAPPEN *** !!!!!!! 2 leaders exist at the same time with the same term. Only happens when no log difference on all nodes.\n")
+				panic("!!! 2 leaders exist at the same time with the same term!!!")
 			}
-			rf.stepDownAsFollower(args.Term)
-			rf.votedFor = args.From
 		}
-		if rf.state == Candidate {
-			rf.stepDownAsFollower(args.Term)
-			rf.votedFor = args.From
+
+		// Different with RequestVote, here we immediately refresh timeout
+		// as when args.Term >= rf.term then means there is a valid leader exist!
+		// No need to do leader log up-to-date check as if leader has some old log it would not be possible
+		// to be elected as leader in the first place.
+		oldTerm := rf.term
+		rf.stepDownAsFollower(args.Term) // refresh election timeout
+		rf.votedFor = args.From          // keep votedFor
+		if args.Term > oldTerm {
+			// rf.tickerContextCancel() // HeatBeat cancel context as args.Term > rf.term
+			rf.persist() // at HeartBeat term updates
 		}
 
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 2. Reply false if log doesn’t contain an entry at prevLogIndex
@@ -307,6 +275,23 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		if rf.lastLogIndex() < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 			reply.Good = false
 			reply.Term = rf.term
+
+			// In the case of rf.log[args.PrevLogIndex].Term != args.PrevLogTerm, a good way to speed up is
+			// delete the follower's log from the end with all the entries that having term as rf.log[args.PrevLogIndex].Term
+			// And we should only deal this situation when rf.lastLogIndex() >= args.PrevLogIndex (follower can have much longer logs than args.PrevLogIndex)
+			// Otherwise, if we don't do this, args.PrevLogIndex will only be reduced as 1 with each HeartBeat, that is too slow.
+			if rf.lastLogIndex() >= args.PrevLogIndex {
+				termToDelete := args.PrevLogTerm
+				newEnd := args.PrevLogIndex - 1
+				for ; newEnd > 0; newEnd-- {
+					if rf.log[newEnd].Term <= termToDelete {
+						break
+					}
+				}
+				rf.log = rf.log[:newEnd+1] // remove/cut all logs having rf.log[i].Term > termToDelete
+				// For the case of when rf.log[newEnd].Term < termToDelete, speed up is handled at the leader side
+				// with information of reply.LastLogTerm
+			}
 
 			reply.LastLogIndex = rf.lastLogIndex() // speed up
 			reply.LastLogTerm = rf.lastLogTerm()
@@ -326,33 +311,45 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			for i, v := range rf.log[args.PrevLogIndex+1 : rf.lastLogIndex()+1] {
 				if i < len(args.Entries) && v.Term != args.Entries[i].Term {
 					rf.log = rf.log[:args.PrevLogIndex+1+i] // here use Index Not Term!...
+					rf.persist()                            // at HeartBeat log updates
+					// SUBTLE BUG PLACE: when cutting rf.log, rf.nextIndexes[x] needs to be cut as well.
+					// This is not really needed for now as when this cut happens the node is already a follower
+					// Then rf.nextIndexes should not be used anymore, and it always gets updated when it steps up as a leader
 					break
 				}
 			}
+
 			// [PAPER] AppendEntries-RPC - Receiver implementation: 4. Append any new Entries not already in the log
 			// leader:       [x, 1, 2, 3, 4] --- args.PrevLogIndex->2, Entries->[3,4]
 			// follower now: [x, 1, 2, 3 ] --- rf.lastLogIndex()->3, diff->1
 			diff := rf.lastLogIndex() - args.PrevLogIndex
-			if diff > 0 {
-				fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa entries has some duplicates append, diff:%v log len:%v\n", diff, len(args.Entries[diff:]))
+
+			if diff >= len(args.Entries) {
+				// for case like:
+				// log: [0, 1, 2, 3, 4, 5, 6] -------------------------> PrevLogIndex=2,
+				//               [3, 4,] ------------------------------> len(args.Entries)=2
+				//         diff := rf.lastLogIndex() - args.PrevLogIndex = (7-2) = 5 > 2 will cause issue
+				// So if after the above "cutting" step results this happens, we just do nothing as the logs has all the same element already.
+				// Here could introduce a subtle bug as in the above example entry [5, 6] might be some old term in valid entry which will be cleaned later
+				// And here we do nothing, but rf.commitIndex could be updated to the very end and could cusing
+				// So we do this `newCommitIndex := min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))` below
+				// instead of `newCommitIndex := min(args.LeaderCommit, rf.lastLogIndex())`, otherwise, TestFigure8Unreliable2C will give commits aligned error under critical conditions
+			} else {
+				if diff > 0 {
+					fmt.Printf("aaaaaaaaaaaaaaaaaaaaaaa entries has some duplicates append, diff:%v log len:%v\n", diff, len(args.Entries[diff:]))
+				}
+				rf.log = append(rf.log, args.Entries[diff:]...)
+				rf.persist() // at HeartBeat log updates
 			}
-			rf.log = append(rf.log, args.Entries[diff:]...)
 		}
 		// [PAPER] AppendEntries-RPC - Receiver implementation: 5.  If LeaderCommit > commitIndex, set commitIndex = min(LeaderCommit, index of last new entry)
 		// Follower commit
 		if args.LeaderCommit > rf.commitIndex {
-			newCommitIndex := min(args.LeaderCommit, rf.lastLogIndex())
+			// IMPORTANT - SUBTLE - To allow TestFigure8Unreliable2C give no commit order issue, need to use args.PrevLogIndex+len(args.Entries), see comments above.
+			newCommitIndex := min(args.LeaderCommit, args.PrevLogIndex+len(args.Entries))
 			if rf.commitIndex != newCommitIndex {
-				startIndex := rf.commitIndex + 1 // start from the new entry after previous committed value
-				rf.commitIndex = newCommitIndex
-				for i, v := range rf.log[startIndex : newCommitIndex+1] {
-					rf.applyCh <- ApplyMsg{
-						CommandValid: true,
-						Command:      v.Command,
-						CommandIndex: startIndex + i,
-					}
-					rf.DPrintf(TopicTickerLeader, "Follower committed new log with index %v\n", startIndex+i)
-				}
+				// apply logs async
+				rf.commitIndex = newCommitIndex // follower update rf.commitIndex
 			}
 		}
 
@@ -363,13 +360,6 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 		reply.Term = rf.term
 		rf.DPrintf(TopicHB, "args.From:%v, args.Term:%v --- Reply Good\n", args.From, args.Term)
 		return
-	} else {
-		// [PAPER] AppendEntries-RPC - Receiver implementation: 1. Reply false if Term < currentTerm (§5.1)
-		// allow election timeout later when receiving AppendEntries RPC from low Term calls
-		reply.Good = false
-		reply.Term = rf.term
-		rf.DPrintf(TopicHB, "args.From:%v, args.Term:%v --- Ignored\n", args.From, args.Term)
-		return // ignore
 	}
 }
 
@@ -435,6 +425,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		Command: command,
 		Term:    rf.term,
 	})
+	rf.persist() // at Start log updates
 
 	return rf.lastLogIndex(), rf.term, true
 }
@@ -490,14 +481,14 @@ func (rf *Raft) ticker() {
 		}
 
 		if rf.state == Leader {
+			rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
+			term := rf.term
 			rf.mu.Unlock()
-			rf.tickerAsLeader()
+			go rf.tickerAsLeader(term)
 			continue
 		} else if rf.state == Follower {
-			rf.term = rf.term + 1 // --------- only place that bumps Term ------------
 			rf.state = Candidate
 			rf.votedFor = -1
-			rf.candidateStartingTime = time.Now()
 			rf.DPrintf(TopicTickerFollower, "----- step up as candidate -----\n")
 			rf.mu.Unlock()
 			continue
@@ -510,9 +501,45 @@ func (rf *Raft) ticker() {
 	}
 }
 
-func (rf *Raft) tickerAsLeader() {
+// return true as we can be sure we are still leader
+// currentTerm is the term when this leader ticker starts
+func (rf *Raft) verifyLeaderState(currentTerm int) bool {
+	if rf.term != currentTerm {
+		votedFor := rf.votedFor
+		rf.stepDownAsFollower(rf.term)
+		rf.votedFor = votedFor // preserveVotedFor
+		rf.persist()
+		return false
+	}
+	// check whether this candidate has been set back to Follower
+	if rf.state == Follower {
+		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		return false
+	}
+	return true
+}
+
+// This method is expected to run async
+func (rf *Raft) tickerAsLeader(currentTerm int) {
+	// Setup tickerContext
+	ctx := context.Background()
+	// In practice, one should probably use a context.WithTimeout(ctx) here to timeout this round of leader ticker
+	// But for making TestFigure8Unreliable2C pass we do not timeout here but wait for the delayed/unstable reply as long as possible
+	// so to avoid test telling us things are not committed (due to HeartBeat to some follower timeout)
+	ctx, _ = context.WithCancel(ctx)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	// QUESTION - adding this part should avoid 2 leaders exist at the same time, but it fails TestFollowerFailure2B???
+	// check term updated asynchronously, if so just return as follower
+	// This solves some subtle bug such as 2 leader with the same term exist and ping each other or
+	// index range issue as rf is step down as follower, rf.log gets cut, but rf.nextIndexes not changed, letting rf.log[rf.nextIndexes[i]-1] below out of range
+	if ok := rf.verifyLeaderState(currentTerm); !ok {
+		return
+	}
+
 	rf.DPrintf(TopicTickerLeader, "Leader sends heartsbeats to others... \n")
 	c1 := make(chan *HeartBeatReply)
 	// specify some temp values to hold these index while having the lock, as rf.log might get changed (new command arrives) when unlocked below to allow the Call method runnable in goroutines
@@ -522,13 +549,12 @@ func (rf *Raft) tickerAsLeader() {
 	copy(matchIndexesToBe, rf.matchIndexes)
 
 	for i, other := range rf.peers {
-		peer := other // needed for solving data race
 		if i != rf.me {
 			var args *HeartBeatRequest = &HeartBeatRequest{
 				From:         rf.me,
-				Term:         rf.term,
+				Term:         currentTerm, // Could be a SUBTLE BUG if rf.term is used, as tickerAsLeader runs async, when we reach here the rf state might already be changed,
 				PrevLogIndex: rf.nextIndexes[i] - 1,
-				PrevLogTerm:  rf.log[rf.nextIndexes[i]-1].Term,
+				PrevLogTerm:  rf.log[rf.nextIndexes[i]-1].Term, // SUBTLE BUG - as this runs async, rf.log could be cut and
 			}
 			var reply *HeartBeatReply = &HeartBeatReply{}
 
@@ -543,14 +569,20 @@ func (rf *Raft) tickerAsLeader() {
 			//                  ---- so args.Entries = rf.log[3, 3+1]
 			rf.DPrintf(TopicTickerLeader, "Leader state before sending ------------ rf.lastLogIndex():%v rf.nextIndexes[%v]:%v \n", rf.lastLogIndex(), i, rf.nextIndexes[i])
 			if rf.lastLogIndex() >= rf.nextIndexes[i] {
-				args.Entries = rf.log[rf.nextIndexes[i] : rf.lastLogIndex()+1]
-				nextIndexesToBe[i] = rf.lastLogIndex() + 1
-				matchIndexesToBe[i] = rf.lastLogIndex() // TODO - is this what to specific for matchIndexesToBe?
+				// limit length of entries, for TestFigure8Unreliable2C to pass, have to use a large value otherwise test run too slow to align an input.
+				entryLength := min(500, rf.lastLogIndex()-rf.nextIndexes[i])
+				// PITFALL - we use a copy to try to avoid data-race at runtime.slicecopy(), so the rf.peer[x].Call() method's input don't have to touch anything related to rf
+				entryCopy := make([]Entry, entryLength+1)
+				copy(entryCopy, rf.log[rf.nextIndexes[i]:rf.nextIndexes[i]+entryLength+1])
+				args.Entries = entryCopy
+				nextIndexesToBe[i] = rf.nextIndexes[i] + entryLength + 1
+				matchIndexesToBe[i] = rf.nextIndexes[i] + entryLength // This should be what to specific for matchIndexesToBe
 			}
 			args.LeaderCommit = rf.commitIndex
 
-			go func() {
-				if ok := peer.Call("Raft.HeartBeat", args, reply); ok {
+			go func(target int, peer *labrpc.ClientEnd) {
+				ok := peer.Call("Raft.HeartBeat", args, reply)
+				if ok {
 					if reply.Good {
 						c1 <- reply
 						return
@@ -558,28 +590,38 @@ func (rf *Raft) tickerAsLeader() {
 				}
 				c1 <- reply
 				rf.mu.Lock()
-				rf.DPrintf(TopicTickerLeader, "Leader<%v> sends heartbeat Term %v to Node<%v> failed\n", args.From, args.Term, i)
+				rf.DPrintf(TopicTickerLeader, "Leader<%v> sends heartbeat Term %v to Node<%v> failed\n", args.From, args.Term, target)
 				rf.mu.Unlock()
-			}()
+			}(i, other)
 		}
 	}
-	currentTerm := rf.term
+
 	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
-	heartBeatCount := 1 // vote for myself
+	heartBeatCount := 1 // Vote for myself
+	replyCount := 1     // Count it the same way as heartBeat
 	for p, _ := range rf.peers {
 		if p != rf.me {
 			select {
 			case reply := <-c1:
 				i := reply.From
 				rf.mu.Lock()
-				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
-				if reply.Term > currentTerm {
-					rf.stepDownAsFollower(reply.Term)
+				// SUBTLE - IMPORTANT - as tickerAsLeader runs async, we have to be sure it is still leader when getting a reply and Lock here again
+				if ok := rf.verifyLeaderState(currentTerm); !ok {
 					return
 				}
-				if reply.Good { // Heartbeat/Commit Successful
-					rf.nextIndexes[i] = nextIndexesToBe[i]
-					rf.matchIndexes[i] = matchIndexesToBe[i]
+
+				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
+				replyCount = replyCount + 1
+				// For passing critical tests, we wait as long as possible,
+				// So comment out ctx cancellation here, otherwise in production system it perhaps better to have this
+				//if replyCount >= len(rf.peers)/2+1 {
+				//	ctxCancelFunc()
+				//}
+				if reply.Good {
+					// Heartbeat/Commit Successful
+					// Only increase those indexes as some old Heartbeat might return slowly or after a newer beat comes back first
+					rf.nextIndexes[i] = max(nextIndexesToBe[i], rf.nextIndexes[i])
+					rf.matchIndexes[i] = max(matchIndexesToBe[i], rf.matchIndexes[i])
 					heartBeatCount = heartBeatCount + 1
 					rf.DPrintf(TopicTickerLeader, "Good -------------------------------------rf.nextIndexes[%v]=%v \n", i, rf.nextIndexes[i])
 				} else {
@@ -589,83 +631,100 @@ func (rf *Raft) tickerAsLeader() {
 					newNextI := min(reply.LastLogIndex+1, rf.nextIndexes[i]-1)
 					for ; newNextI > 1 && rf.log[newNextI].Term > reply.LastLogTerm; newNextI-- {
 					}
-					rf.nextIndexes[i] = max(1, newNextI) // speed up
+					rf.nextIndexes[i] = max(1, newNextI)                             // speed up
+					rf.nextIndexes[i] = max(rf.nextIndexes[i], rf.matchIndexes[i]+1) // IMPORTANT - SUBTLE BUG - as leader ticker is async, do not reduce nextIndexes if matchIndexes already updated! Otherwise, seeing nextIndexes jumps back and forth
 					if d := old - rf.nextIndexes[i]; d > 0 {
 						fmt.Printf("----------------------- speed up ---------------- nextIndexes old-new :%v\n", d)
 					}
-					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
+					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v; rf.log[rf.nextIndexes[i]].Term=%v, reply.LastLogTerm=%v\n", i, i, rf.nextIndexes[i], rf.log[rf.nextIndexes[i]-1].Term, reply.LastLogTerm)
+				}
+				// increase rf.commitIndex as soon as possible in case of some follower is offline for return very slow
+				if heartBeatCount >= len(rf.peers)/2+1 {
+					rf.checkAndUpdateCommitIndex(currentTerm)
 				}
 				rf.mu.Unlock()
-			case <-time.After(time.Millisecond * 10):
+			//// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
+			case <-ctx.Done(): // time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
-				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout, giving up calling\n")
+				rf.DPrintf(TopicTickerLeader, "Leader call to a peer timeout by rf.tickerContext.Done(), giving up calling\n")
 				rf.mu.Unlock()
 			}
 		}
 	}
 	rf.mu.Lock()
+}
 
-	if heartBeatCount >= len(rf.peers)/2+1 {
-		// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
-		// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
-		// We have to use a `validNExist` to firstly find a valid N then do the commit because there could be
-		// a special case that some uncommitted logs has a lower term should not be committed if there does not exist
-		// an uncommitted log with current term and also replicated. see https://youtu.be/YbZ3zDzDnrw?t=2136
-		// For example:
-		// If term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1}], then {106 1} should not be committed
-		// Then later if term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1} {106 3}], then {106 1} and {106 3} should both be committed when {106 3} is replicated
-		N := rf.commitIndex + 1
-		validNExist := false
-		for ; N <= rf.lastLogIndex(); N = N + 1 { // make it more efficient, jump more with N
-			numberOfMatchIndexLEtoN := 1
-			for i, _ := range rf.peers {
-				if i != rf.me && rf.matchIndexes[i] >= N {
-					numberOfMatchIndexLEtoN = numberOfMatchIndexLEtoN + 1
-				}
-			}
-			if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 {
-				if rf.log[N].Term == currentTerm {
-					validNExist = true
-					break
-				}
-			} else {
-				break
+func (rf *Raft) checkAndUpdateCommitIndex(currentTerm int) {
+
+	// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
+	// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
+	// We have to use a `validNExist` to firstly find a valid N then do the commit because there could be
+	// a special case that some uncommitted logs has a lower term should not be committed if there does not exist
+	// an uncommitted log with current term and also replicated. see https://youtu.be/YbZ3zDzDnrw?t=2136
+	// For example:
+	// If term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1}], then {106 1} should not be committed
+	// Then later if term=3 commitIndex=5, and log=[{<nil> 0} {101 1} {102 1} {103 1} {104 1} {105 1} {106 1} {106 3}], then {106 1} and {106 3} should both be committed when {106 3} is replicated
+	N := rf.commitIndex + 1
+	for ; N <= rf.lastLogIndex(); N = N + 1 { // make it more efficient, jump more with N
+		numberOfMatchIndexLEtoN := 1
+		for i, _ := range rf.peers {
+			if i != rf.me && rf.matchIndexes[i] >= N {
+				numberOfMatchIndexLEtoN = numberOfMatchIndexLEtoN + 1
 			}
 		}
-		if validNExist {
-			for i := rf.commitIndex + 1; i <= N; i++ {
-				// Leader commit
-				rf.commitIndex = i
-				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command:      rf.log[i].Command,
-					CommandIndex: i,
-				}
-				rf.DPrintf(TopicTickerLeader, "Leader committed new log\n")
+		if numberOfMatchIndexLEtoN >= len(rf.peers)/2+1 {
+			if rf.log[N].Term == currentTerm {
+				rf.commitIndex = N
 			}
+		} else {
+			break
 		}
 	}
-	rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
 }
+
+func (rf *Raft) sendApplyMsg() {
+	for {
+		time.Sleep(time.Millisecond * 100)
+		rf.mu.Lock()
+		toIndex := rf.commitIndex
+		rf.mu.Unlock()
+
+		for i := rf.lastApplied + 1; i <= toIndex; i++ {
+			// Leader commit
+			rf.mu.Lock()
+			msg := ApplyMsg{
+				CommandValid: true,
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
+			}
+			rf.DPrintf(TopicAsyncCommit, "%v[%v] committed new log on index[%v]\n", rf.state, rf.me, i)
+			rf.lastApplied = i
+			rf.mu.Unlock()
+
+			rf.applyCh <- msg
+		}
+	}
+
+}
+
 func (rf *Raft) tickerAsCandidate() {
 	//  A candidate continues in this state until one of three things happens:
 	//  (a) it wins the election,
 	//  (b) another server establishes itself as leader, or
 	//  (c) a period of time goes by with no winner
 
+	// Setup tickerContext
+	ctx := context.Background()
+	ctx, ctxCancelFunc := context.WithTimeout(ctx, time.Millisecond*2000)
+
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if time.Now().After(rf.candidateStartingTime.Add(rf.getElectionTimeoutDuration())) {
-		rf.DPrintf(TopicTickerCandidate, "Step down from candidate to follower as timeout\n")
-		rf.stepDownAsFollower(rf.term - 1)
-		return
-	}
+	rf.term = rf.term + 1 // --------- only place that bumps Term ------------
 
-	rf.DPrintf(TopicTickerLeader, "Candidate calls all others for vote\n")
+	rf.DPrintf(TopicTickerCandidate, "Candidate calls all others for vote\n")
 	c1 := make(chan *RequestVoteReply)
 	for i, other := range rf.peers {
 		if i != rf.me {
-			peer := other
 			var args *RequestVoteArgs = &RequestVoteArgs{
 				From:         rf.me,
 				Term:         rf.term,
@@ -673,7 +732,7 @@ func (rf *Raft) tickerAsCandidate() {
 				LastLogTerm:  rf.lastLogTerm(),
 			}
 			var reply *RequestVoteReply = &RequestVoteReply{}
-			go func() {
+			go func(peer *labrpc.ClientEnd) {
 				if ok := peer.Call("Raft.RequestVote", args, reply); ok {
 					if reply.Agree {
 						c1 <- reply
@@ -681,33 +740,41 @@ func (rf *Raft) tickerAsCandidate() {
 					}
 				}
 				c1 <- reply
-			}()
+			}(other)
 		}
 	}
 	currentTerm := rf.term
 	rf.mu.Unlock()
 	voteCount := 1 // vote for myself
+	replyMaxTerm := 0
 	for p, _ := range rf.peers {
 		if p != rf.me {
 			select {
 			case reply := <-c1:
-				if reply.Term > currentTerm {
-					rf.mu.Lock()
-					rf.stepDownAsFollower(reply.Term)
-					return
-				}
+				replyMaxTerm = max(replyMaxTerm, reply.Term)
 				if reply.Agree {
 					voteCount = voteCount + 1
+					if voteCount >= len(rf.peers)/2+1 {
+						ctxCancelFunc()
+					}
 				}
-			case <-time.After(time.Millisecond * 10):
+			// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
+			case <-ctx.Done(): // time.After(rf.remoteCallTimeoutDuration):
 				rf.mu.Lock()
-				rf.DPrintf(TopicTickerLeader, "Candidate call for vote to a peer timeout, giving up calling\n")
+				rf.DPrintf(TopicTickerCandidate, "Candidate call for vote to a peer timeout, giving up calling\n")
 				rf.mu.Unlock()
 			}
 		}
 	}
 	rf.mu.Lock()
-
+	// check termUpdated asynchronously, if so just return as follower
+	if replyMaxTerm > currentTerm {
+		votedFor := rf.votedFor
+		rf.stepDownAsFollower(replyMaxTerm)
+		rf.votedFor = votedFor // preserve VotedFor
+		rf.persist()
+		return
+	}
 	// check whether this candidate has been set back to Follower
 	if rf.state == Follower {
 		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
@@ -721,19 +788,21 @@ func (rf *Raft) tickerAsCandidate() {
 		rf.state = Leader
 		for i, _ := range rf.peers {
 			if i != rf.me {
-				rf.nextIndexes[i] = rf.commitIndex + 1
+				rf.nextIndexes[i] = rf.lastLogIndex() + 1
 				rf.matchIndexes[i] = 0
 			}
 		}
 	} else {
-		rf.electionTimeoutTime = time.Now().Add(rf.heartsBeatDuration)
+		// reset election timer, it is okay to step down here as the election timeout it will be up as a candidate again
+		// with a new term
+		rf.stepDownAsFollower(rf.term)
 	}
 }
 
 func (rf *Raft) stepDownAsFollower(term int) {
 	rf.state = Follower
-	rf.term = term
-	rf.votedFor = -1 // IMPORTANT - need to clean votedFor when step down
+	rf.term = max(rf.term, term) // IMPORTANT
+	rf.votedFor = -1             // IMPORTANT - need to clean votedFor when step down
 	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
 }
 
@@ -758,9 +827,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.followerTimeout = time.Millisecond * 300 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
+	rf.followerTimeout = time.Millisecond * 250 // Follower Time Out, should be 2 or 3 times larger than heartsBeatDuration, otherwise seen frequent re-election
 	rf.rand = rand.New(rand.NewSource(time.Now().UnixNano()))
 	rf.heartsBeatDuration = time.Millisecond * 100 // Heart Beat Duration, seems to be above 100ms to allow test work well otherwise datarace?
+	rf.remoteCallTimeoutDuration = time.Millisecond * 2000
 	rf.applyCh = applyCh
 	rf.nextIndexes = make([]int, len(peers))
 	rf.matchIndexes = make([]int, len(peers))
@@ -775,7 +845,81 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	// start goroutine to apply messages
+	go rf.sendApplyMsg()
+
 	return rf
+}
+
+//
+// save Raft's persistent state to stable storage,
+// where it can later be retrieved after a crash and restart.
+// see paper's Figure 2 for a description of what should be persistent.
+//
+func (rf *Raft) persist() {
+	// Your code here (2C).
+	// Example:
+
+	if rf.state == Candidate {
+		panic("########################## Persist with Candidate state...?")
+	}
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.me)
+	e.Encode(rf.term)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
+}
+
+//
+// restore previously persisted state.
+//
+func (rf *Raft) readPersist(data []byte) {
+	if data == nil || len(data) < 1 { // bootstrap without any state?
+		return
+	}
+	// Your code here (2C).
+	// Example:
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var me int
+	var term int
+	var votedFor int
+	var log []Entry
+	if d.Decode(&me) != nil ||
+		d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		rf.DPrintf(TopicPersistError, "readPersist failed?!")
+	} else {
+		rf.me = me
+		rf.term = term
+		rf.votedFor = votedFor
+		rf.log = log
+	}
+}
+
+//
+// A service wants to switch to snapshot.  Only do so if Raft hasn't
+// have more recent info since it communicate the snapshot on applyCh.
+//
+func (rf *Raft) CondInstallSnapshot(lastIncludedTerm int, lastIncludedIndex int, snapshot []byte) bool {
+
+	// Your code here (2D).
+
+	return true
+}
+
+// the service says it has created a snapshot that has
+// all info up to and including index. this means the
+// service no longer needs the log through (and including)
+// that index. Raft should now trim its log as much as possible.
+func (rf *Raft) Snapshot(index int, snapshot []byte) {
+	// Your code here (2D).
+
 }
 
 // getElectionTimeoutDuration returns a duration between [rf.followerTimeout, rf.followerTimeout + 200)
@@ -787,7 +931,9 @@ func (rf *Raft) getElectionTimeoutDuration() time.Duration {
 func (rf *Raft) DPrintf(topic logTopic, format string, a ...interface{}) {
 	rfTrace := fmt.Sprintf("Node<%v> [%v]|Term(%v)|VotedFor(%v)|CIndex(%v)|%v",
 		rf.me, rf.state, rf.term, rf.votedFor, rf.commitIndex, rf.log)
-	TPrintf(topic, rfTrace, format, a...)
+	rfDebug := fmt.Sprintf("Node<%v> [%v]|Term(%v)|VotedFor(%v)|CIndex(%v)|logLen(%v)",
+		rf.me, rf.state, rf.term, rf.votedFor, rf.commitIndex, len(rf.log))
+	TPrintf(topic, rfTrace, rfDebug, format, a...)
 }
 
 func min(a, b int) int {

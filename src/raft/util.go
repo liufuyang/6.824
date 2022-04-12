@@ -29,6 +29,9 @@ const (
 	TopicTickerFollower  logTopic = "TKFollower "
 	TopicTickerLeader    logTopic = "TKLeader   "
 	TopicStart           logTopic = "Start/Req  "
+	TopicPersist         logTopic = "Persist    "
+	TopicPersistError    logTopic = "PersistErr "
+	TopicAsyncCommit     logTopic = "AsyncCommit"
 )
 
 type logLevel int
@@ -64,7 +67,7 @@ func init() {
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
-func TPrintf(topic logTopic, traceStr string, format string, a ...interface{}) {
+func TPrintf(topic logTopic, traceStr string, debugStr string, format string, a ...interface{}) {
 	//if topic == TopicVR { // change this to filter other logs
 	//	return
 	//}
@@ -79,7 +82,7 @@ func TPrintf(topic logTopic, traceStr string, format string, a ...interface{}) {
 	if debugVerbosity == trace {
 		prefix = fmt.Sprintf("%03d|%03dMS [%v] |%v| - ", time1000MS, timeMS, topic, traceStr)
 	} else if debugVerbosity == debug {
-		prefix = fmt.Sprintf("%06d [%v] - ", time, topic)
+		prefix = fmt.Sprintf("%03d|%03dMS [%v] %v - ", time1000MS, timeMS, topic, debugStr)
 	}
 
 	format = prefix + format
