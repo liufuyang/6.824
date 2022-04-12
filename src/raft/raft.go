@@ -276,6 +276,23 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 			reply.Good = false
 			reply.Term = rf.term
 
+			// In the case of rf.log[args.PrevLogIndex].Term != args.PrevLogTerm, a good way to speed up is
+			// delete the follower's log from the end with all the entries that having term as rf.log[args.PrevLogIndex].Term
+			// And we should only deal this situation when rf.lastLogIndex() >= args.PrevLogIndex (follower can have much longer logs than args.PrevLogIndex)
+			// Otherwise, if we don't do this, args.PrevLogIndex will only be reduced as 1 with each HeartBeat, that is too slow.
+			if rf.lastLogIndex() >= args.PrevLogIndex {
+				termToDelete := args.PrevLogTerm
+				newEnd := args.PrevLogIndex - 1
+				for ; newEnd > 0; newEnd-- {
+					if rf.log[newEnd].Term <= termToDelete {
+						break
+					}
+				}
+				rf.log = rf.log[:newEnd+1] // remove/cut all logs having rf.log[i].Term > termToDelete
+				// For the case of when rf.log[newEnd].Term < termToDelete, speed up is handled at the leader side
+				// with information of reply.LastLogTerm
+			}
+
 			reply.LastLogIndex = rf.lastLogIndex() // speed up
 			reply.LastLogTerm = rf.lastLogTerm()
 
@@ -485,6 +502,25 @@ func (rf *Raft) ticker() {
 	}
 }
 
+// return true as we can be sure we are still leader
+// currentTerm is the term when this leader ticker starts
+func (rf *Raft) verifyLeaderState(currentTerm int) bool {
+	if rf.term != currentTerm {
+		votedFor := rf.votedFor
+		rf.stepDownAsFollower(rf.term)
+		rf.votedFor = votedFor // preserveVotedFor
+		rf.persist()
+		return false
+	}
+	// check whether this candidate has been set back to Follower
+	if rf.state == Follower {
+		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
+		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+		return false
+	}
+	return true
+}
+
 // This method is expected to run async
 func (rf *Raft) tickerAsLeader(currentTerm int) {
 	// Setup tickerContext
@@ -498,19 +534,23 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 	// check term updated asynchronously, if so just return as follower
 	// This solves some subtle bug such as 2 leader with the same term exist and ping each other or
 	// index range issue as rf is step down as follower, rf.log gets cut, but rf.nextIndexes not changed, letting rf.log[rf.nextIndexes[i]-1] below out of range
-	if rf.term != currentTerm {
-		votedFor := rf.votedFor
-		rf.stepDownAsFollower(rf.term)
-		rf.votedFor = votedFor // preserveVotedFor
-		rf.persist()
+	if ok := rf.verifyLeaderState(currentTerm); !ok {
 		return
 	}
-	// check whether this candidate has been set back to Follower
-	if rf.state == Follower {
-		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
-		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-		return
-	}
+	//
+	//if rf.term != currentTerm {
+	//	votedFor := rf.votedFor
+	//	rf.stepDownAsFollower(rf.term)
+	//	rf.votedFor = votedFor // preserveVotedFor
+	//	rf.persist()
+	//	return
+	//}
+	//// check whether this candidate has been set back to Follower
+	//if rf.state == Follower {
+	//	rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
+	//	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+	//	return
+	//}
 
 	rf.DPrintf(TopicTickerLeader, "Leader sends heartsbeats to others... \n")
 	c1 := make(chan *HeartBeatReply)
@@ -567,18 +607,21 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 			}(i, other)
 		}
 	}
-	lastLogIndexForThisBeat := rf.lastLogIndex()
 
 	rf.mu.Unlock()      // Unlock here to allow the Call method runnable in goroutines
 	heartBeatCount := 1 // Vote for myself
 	replyCount := 1     // Count it the same way as heartBeat
-	termUpdated := false
 	for p, _ := range rf.peers {
 		if p != rf.me {
 			select {
 			case reply := <-c1:
 				i := reply.From
 				rf.mu.Lock()
+				// SUBTLE - IMPORTANT - as tickerAsLeader runs async, we have to be sure it is still leader when getting a reply and Lock here again
+				if ok := rf.verifyLeaderState(currentTerm); !ok {
+					return
+				}
+
 				rf.DPrintf(TopicTickerLeader, "Leader call to peer %v replied\n", i)
 				replyCount = replyCount + 1
 				// For passing critical tests, we wait as long as possible,
@@ -586,9 +629,6 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 				//if replyCount >= len(rf.peers)/2+1 {
 				//	ctxCancelFunc()
 				//}
-				if reply.Term > currentTerm {
-					termUpdated = true
-				}
 				if reply.Good {
 					// Heartbeat/Commit Successful
 					// Only increase those indexes as some old Heartbeat might return slowly or after a newer beat comes back first
@@ -603,15 +643,16 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 					newNextI := min(reply.LastLogIndex+1, rf.nextIndexes[i]-1)
 					for ; newNextI > 1 && rf.log[newNextI].Term > reply.LastLogTerm; newNextI-- {
 					}
-					rf.nextIndexes[i] = max(1, newNextI) // speed up
+					rf.nextIndexes[i] = max(1, newNextI)                             // speed up
+					rf.nextIndexes[i] = max(rf.nextIndexes[i], rf.matchIndexes[i]+1) // Important, as leader ticker is async, do not reduce nextIndexes if matchIndexes already updated!
 					if d := old - rf.nextIndexes[i]; d > 0 {
 						fmt.Printf("----------------------- speed up ---------------- nextIndexes old-new :%v\n", d)
 					}
-					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v\n", i, i, rf.nextIndexes[i])
+					rf.DPrintf(TopicTickerLeader, "Leader call to peer %v reply not good, nextIndex mismatch? New nextIndex[%v]=%v; rf.log[rf.nextIndexes[i]].Term=%v, reply.LastLogTerm=%v\n", i, i, rf.nextIndexes[i], rf.log[rf.nextIndexes[i]-1].Term, reply.LastLogTerm)
 				}
 				// increase rf.commitIndex as soon as possible in case of some follower is offline for return very slow
 				if heartBeatCount >= len(rf.peers)/2+1 {
-					rf.checkAndUpdateCommitIndex(termUpdated, currentTerm, lastLogIndexForThisBeat)
+					rf.checkAndUpdateCommitIndex(currentTerm)
 				}
 				rf.mu.Unlock()
 			//// In practice, we could add timeout here, but for test to pass, we wait indefinitely?
@@ -625,22 +666,25 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 	rf.mu.Lock()
 }
 
-// lastLogIndexForThisBeat is used here to prevent rf.log updated between each heart beat goroutine
-func (rf *Raft) checkAndUpdateCommitIndex(termUpdated bool, currentTerm int, lastLogIndexForThisBeat int) {
+func (rf *Raft) checkAndUpdateCommitIndex(currentTerm int) {
 	////check termUpdated asynchronously, if so just return as follower
-	if termUpdated {
-		votedFor := rf.votedFor
-		rf.stepDownAsFollower(rf.term)
-		rf.votedFor = votedFor // preserveVotedFor
-		rf.persist()
-		return
-	}
-	// check whether this candidate has been set back to Follower
-	if rf.state == Follower {
-		rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
-		rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-		return
-	}
+	//if termUpdated {
+	//	votedFor := rf.votedFor
+	//	rf.stepDownAsFollower(rf.term)
+	//	rf.votedFor = votedFor // preserveVotedFor
+	//	rf.persist()
+	//	return
+	//}
+	//// check whether this candidate has been set back to Follower
+	//if rf.state == Follower {
+	//	rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
+	//	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
+	//	return
+	//}
+	//
+	//if ok:= rf.verifyLeaderState(currentTerm); !ok {
+	//	return
+	//}
 
 	// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
