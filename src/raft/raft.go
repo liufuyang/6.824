@@ -537,20 +537,6 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 	if ok := rf.verifyLeaderState(currentTerm); !ok {
 		return
 	}
-	//
-	//if rf.term != currentTerm {
-	//	votedFor := rf.votedFor
-	//	rf.stepDownAsFollower(rf.term)
-	//	rf.votedFor = votedFor // preserveVotedFor
-	//	rf.persist()
-	//	return
-	//}
-	//// check whether this candidate has been set back to Follower
-	//if rf.state == Follower {
-	//	rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
-	//	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-	//	return
-	//}
 
 	rf.DPrintf(TopicTickerLeader, "Leader sends heartsbeats to others... \n")
 	c1 := make(chan *HeartBeatReply)
@@ -667,24 +653,6 @@ func (rf *Raft) tickerAsLeader(currentTerm int) {
 }
 
 func (rf *Raft) checkAndUpdateCommitIndex(currentTerm int) {
-	////check termUpdated asynchronously, if so just return as follower
-	//if termUpdated {
-	//	votedFor := rf.votedFor
-	//	rf.stepDownAsFollower(rf.term)
-	//	rf.votedFor = votedFor // preserveVotedFor
-	//	rf.persist()
-	//	return
-	//}
-	//// check whether this candidate has been set back to Follower
-	//if rf.state == Follower {
-	//	rf.DPrintf(TopicTickerCandidate, "Set back to Follower\n")
-	//	rf.electionTimeoutTime = time.Now().Add(rf.getElectionTimeoutDuration())
-	//	return
-	//}
-	//
-	//if ok:= rf.verifyLeaderState(currentTerm); !ok {
-	//	return
-	//}
 
 	// [PAPER] Rules for Servers - Leader 4. If there exists an N such that N > commitIndex, a majority
 	// of matchIndex[i] ≥ N, and log[N].Term == currentTerm: set commitIndex = N (§5.3, §5.4).
