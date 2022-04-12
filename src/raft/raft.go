@@ -221,7 +221,7 @@ type HeartBeatRequest struct {
 	LeaderCommit int     // leader’s commitIndex
 }
 type HeartBeatReply struct {
-	Good         bool // true if follower contained entry matching prevLogIndex and prevLogTerm - TODO
+	Good         bool // true if follower contained entry matching prevLogIndex and prevLogTerm
 	Term         int
 	From         int
 	LastLogIndex int // for speed up finding nextIndex
@@ -314,13 +314,7 @@ func (rf *Raft) HeartBeat(args *HeartBeatRequest, reply *HeartBeatReply) {
 					rf.persist()                            // at HeartBeat log updates
 					// SUBTLE BUG PLACE: when cutting rf.log, rf.nextIndexes[x] needs to be cut as well.
 					// This is not really needed for now as when this cut happens the node is already a follower
-					// Then rf.nextIndexes should not be used anymore and it always get updated when it steps up as a leader
-					//for i, _ := range rf.peers {
-					//	if rf.me != i {
-					//		rf.nextIndexes[i] = min(rf.nextIndexes[i], rf.lastLogIndex()+1)
-					//	}
-					//}
-
+					// Then rf.nextIndexes should not be used anymore, and it always gets updated when it steps up as a leader
 					break
 				}
 			}
