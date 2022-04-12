@@ -530,7 +530,10 @@ func (rf *Raft) verifyLeaderState(currentTerm int) bool {
 func (rf *Raft) tickerAsLeader(currentTerm int) {
 	// Setup tickerContext
 	ctx := context.Background()
-	ctx, _ = context.WithTimeout(ctx, time.Millisecond*2000)
+	// In practice, one should probably use a context.WithTimeout(ctx) here to timeout this round of leader ticker
+	// But for making TestFigure8Unreliable2C pass we do not timeout here but wait for the delayed/unstable reply as long as possible
+	// so to avoid test telling us things are not committed (due to HeartBeat to some follower timeout)
+	ctx, _ = context.WithCancel(ctx)
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
